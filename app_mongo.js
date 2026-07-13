@@ -276,6 +276,10 @@ wss.on('connection', (ws, req) => {
             case "made":
                 made(ws, message);
             break;
+            // participant cancels a queued tx by its slate/message id
+            case "canceltx":
+                canceltx(ws, message);
+            break;
             /**
              * @deprecated epicbox protocol version 3.0.0
              */
@@ -620,6 +624,94 @@ const made = (ws, message) => {
 
 
 /*
+ participant cancels a queued tx by its slate/message id.
+ The relay cannot look inside encrypted slatepack payloads, so the
+ addressable handle is the epicbox message id (the same id clients receive
+ as `epicboxmsgid` with every slate). Stateless with respect to slatepack
+ negotiation steps: we only clear the queued slate from the DB.
+
+ The requester must also be a participant of the tx (recipient queue or
+ sender replyto); otherwise we answer a generic Ok so canceltx cannot be
+ used to probe which message ids exist on the relay..
+
+ @param {object} ws  - Client socket
+ @param {json} message - { type: "canceltx", slateid: "<32-char epicboxmsgid>", signature: "<sig over id>" }
+                         (epicboxmsgid is accepted as an alias for slateid;
+                          wallet slate UUIDs are rejected - the relay cannot
+                          resolve them)
+*/
+const canceltx = (ws, message) => {
+
+    // must have proven address ownership in this session first
+    if (ws.epicPublicAddress == null) {
+        return ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Subscribe before canceltx."}));
+    }
+
+    // accept slateid (preferred) or epicboxmsgid for symmetry with 'made'
+    const slateid = typeof message.slateid === 'string' ? message.slateid
+                  : (typeof message.epicboxmsgid === 'string' ? message.epicboxmsgid : null);
+
+    // epicbox message ids are uid(32) and exactly 32 alphanumeric chars.
+    // Wallet slate UUIDs are a different identifier the relay cannot
+    // resolve or track due to encryption. Other formats are rejected
+    if (slateid === null || !/^[A-Za-z0-9]{32}$/.test(slateid)) {
+        return ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Invalid id: expected the 32-char epicboxmsgid, not the wallet slate UUID."}));
+    }
+
+    if (typeof message.signature !== 'string') {
+        return ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Missing signature."}));
+    }
+
+    // verify signature
+    epicboxlib(["verifysignature", ws.epicPublicAddress, slateid, message.signature], (verified) => {
+
+        if (!verified) {
+            return ws.send(JSON.stringify({type: "Error", kind: "InvalidSignature", description: "Invalid signature."}));
+        }
+
+        // fetch first, then authorize in JS: the requester must be a
+        // participant of the tx. queue holds the recipient public key,
+        // replyto holds the sender address (publickey or publickey@domain).
+        collection.findOne({ messageid: slateid }).then((dbslate) => {
+
+            const isParticipant = dbslate != null && (
+                dbslate.queue === ws.epicPublicAddress ||
+                dbslate.replyto === ws.epicPublicAddress ||
+                (typeof dbslate.replyto === 'string' && dbslate.replyto.split('@')[0] === ws.epicPublicAddress)
+            );
+
+            if (!isParticipant) {
+                // identical response whether the id is unknown or belongs to
+                // someone else, avoiding existence probing
+                console.log("canceltx: no matching slate for", ws.epicPublicAddress, slateid);
+                return ws.send(JSON.stringify({type: "Ok"}));
+            }
+
+            collection.deleteOne({ _id: dbslate._id }).then((delResult) => {
+                console.log("canceltx: deleted", slateid, "for", ws.epicPublicAddress);
+                config.debugMessage ? console.log("DB delete result", delResult) : null;
+
+                // if this socket was blocked waiting on that very slate,
+                // unblock it so the next challenge->subscribe cycle can
+                // deliver the next queued slate
+                ws.process_slate = false;
+                ws.sendslate_attempts = 0;
+
+                ws.send(JSON.stringify({type: "Ok"}));
+            }).catch((err) => {
+                console.error("Error canceltx delete", err);
+                ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Cancel failed, try again."}));
+            });
+
+        }).catch((err) => {
+            console.error("Error canceltx lookup", err);
+            ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Cancel failed, try again."}));
+        });
+    });
+}
+
+
+/*
  store tx in db or forward to foreign epicbox
  if domain does not match our epicbox domain
  @param {object} ws  - Client socket
@@ -684,13 +776,18 @@ const postSlate = (ws, json) => {
                 collection.updateOne({ messageid: messageid }, { $set: { made: true } })
                     .catch((err) => console.error("Error updateOne", err));
             }
-            ws.send(JSON.stringify({type:"Ok"}));
+            // include the message id so the sender can canceltx later;
+            // older wallets ignore unknown fields on Ok
+            ws.send(JSON.stringify({type:"Ok", epicboxmsgid: messageid}));
             receiver.send(JSON.stringify(slate));
             receiver.process_slate = true;
             console.log("Passthrough slate to", receiver.epicPublicAddress);
             config.debugMessage ? console.log(slate) : null;
         } else {
-            ws.send(JSON.stringify({type:"Ok"}));
+            // receiver offline: slate stays queued in db. Return the
+            // message id so the sender can canceltx later; older wallets
+            // ignore unknown fields on Ok
+            ws.send(JSON.stringify({type:"Ok", epicboxmsgid: messageid}));
         }
         return; // Do not relay externally
     }
