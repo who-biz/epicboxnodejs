@@ -1,18 +1,33 @@
-# Use the official MongoDB image
-version: '3.8'
 services:
   mongodb:
-    image: mongo:6.0
+    #TODO: (Biz) needs discussion, or a automatic fix. Should we just use 7.0?
+    # we have an existing mongo_data volume created by 6.0, for all service providers.
+    # we cannot go 6.0 to 8.0 directly... need to step through 7.0 first.
+    #
+    # case is not handled yet but we can run mongo:7.0 once, setFeatureCompatibilityVersion "7.0",
+    # then move to 8.0. Alternatively, we can drain and recreate the volume
+    image: mongo:8.0.26
     container_name: mongodb
     restart: always
-    # ports section removed; not needed for internal Docker Compose networking
+    # mongo is only reachable on the internal compose network, ports section unnecessary
     environment:
-      - MONGO_INITDB_ROOT_USERNAME=root
-      - MONGO_INITDB_ROOT_PASSWORD=rootpass
+      # no defaults here. compose should fail loudly if they are unset
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_ROOT_USER:?set in .env}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_ROOT_PASSWORD:?set in .env}
       - MONGO_INITDB_DATABASE=epicbox
+      # make app-user password available to mongo-init through
+      # process.env so as not to hardcode in the init script either
+      - EPICBOX_DB_PASSWORD=${EPICBOX_DB_PASSWORD:?set in .env}
     volumes:
       - mongo_data:/data/db
       - ./mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+    # wait for mongo to actually accept connections, not just that container exists
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   epicbox1:
     build:
@@ -21,15 +36,19 @@ services:
     container_name: epicbox1
     restart: always
     environment:
-      - MONGO_URL=mongodb://epicbox:epicboxpass@mongodb:27017/epicbox?authSource=epicbox
+      # password comes from env instead of old default
+      - MONGO_URL=mongodb://epicbox:${EPICBOX_DB_PASSWORD:?set in .env}@mongodb:27017/epicbox?authSource=epicbox
       - EPICBOX_INSTANCE_ID=1
       - EPICBOX_DOMAIN=${EPICBOX_DOMAIN:-epicbox.your-domain.com}
       - EPICBOX_PORT=${EPICBOX_PORT:-443}
+    # wait for mongo to be healthy, after start
+    # fails with 10s timeout
     depends_on:
-      - mongodb
+      mongodb:
+        condition: service_healthy
     ports:
-      - "8888:3423"
-    
+      - "127.0.0.1:8888:3423"
+
   epicbox2:
     build:
       context: .
@@ -37,24 +56,42 @@ services:
     container_name: epicbox2
     restart: always
     environment:
-      - MONGO_URL=mongodb://epicbox:epicboxpass@mongodb:27017/epicbox?authSource=epicbox
+      - MONGO_URL=mongodb://epicbox:${EPICBOX_DB_PASSWORD:?set in .env}@mongodb:27017/epicbox?authSource=epicbox
       - EPICBOX_INSTANCE_ID=2
       - EPICBOX_DOMAIN=${EPICBOX_DOMAIN:-epicbox.your-domain.com}
       - EPICBOX_PORT=${EPICBOX_PORT:-443}
     depends_on:
-      - mongodb
+      mongodb:
+        condition: service_healthy
     ports:
-      - "8889:3423"
-      
+      - "127.0.0.1:8889:3423"
+
   nginx:
+    # Fable says we should ideally not use simply nginx:alpine tag. note below:
+    #
+    # For reproducible, supply-chain-safe deploys, pin this to the current stable tag or
+    # (better) a digest, e.g.:
+    #   image: nginx:alpine@sha256:<digest>
+    # Get the digest of the image you have vetted with:
+    #   docker inspect --format='{{index .RepoDigests 0}}' nginx:alpine
     image: nginx:alpine
     container_name: nginx
     restart: always
     ports:
-      - "8443:443"
-    entrypoint: ["/bin/sh", "-c", "envsubst < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf && nginx -g 'daemon off;'"]
+      - "${NGINX_PORT:-8443}:443"
+    # pass variables to the container
+    environment:
+      - EPICBOX_DOMAIN=${EPICBOX_DOMAIN:-epicbox.your-domain.com}
+      - EPICBOX_PORT=${EPICBOX_PORT:-443}
+    # restrict it to exactly the vars in template
+    # should extend the list, if more are added
+    entrypoint: ["/bin/sh", "-c", "envsubst '$$EPICBOX_DOMAIN $$EPICBOX_PORT' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf && exec nginx -g 'daemon off;'"]
     volumes:
       - ./nginx/nginx.conf.template:/etc/nginx/nginx.conf.template:ro
+      # FABLE NOTE: nginx listens on 443 but no certificate volume is mounted in
+      # this file. If your template references ssl_certificate paths, mount
+      # them read-only, e.g.:
+      # - ./nginx/certs:/etc/nginx/certs:ro
     depends_on:
       - epicbox1
       - epicbox2

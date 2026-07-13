@@ -73,12 +73,19 @@ Epicbox Relay Server for Epic Cash, built with Node.js and Rust.
 	git submodule update --init --recursive
 	```
 
-2. **Build and start all services with Docker Compose:**
+2. **Create your `.env` file (required):**
+	Database credentials are not stored in the repository. Compose will not start without them:
+	```sh
+	cp .env.example .env
+	```
+	Edit `.env` and set strong values for `MONGO_ROOT_USER`, `MONGO_ROOT_PASSWORD`, and `EPICBOX_DB_PASSWORD` (e.g. `openssl rand -base64 24`). Do not commit `.env`.
+
+3. **Build and start all services with Docker Compose:**
 	```sh
 	docker compose up -d --build
 	```
 
-3. **Custom configuration via environment variables:**
+4. **Custom configuration via environment variables:**
 	You can override key settings at runtime:
 	```sh
 	EPICBOX_DOMAIN=my.domain.com docker compose up -d --build
@@ -87,10 +94,10 @@ Epicbox Relay Server for Epic Cash, built with Node.js and Rust.
 	- `EPICBOX_PORT`: Sets the port for epicbox services (default: 443)
 	- `NGINX_PORT`: Sets the external port for nginx (default: 8443)
 
-4. **Access the service:**
-	- Open `http://localhost:8443` (or your chosen NGINX_PORT) in your browser.
+5. **Access the service:**
+	- Open `https://localhost:8443` (or your chosen NGINX_PORT) in your browser.
 
-5. **Scaling and failover:**
+6. **Scaling and failover:**
 	- Two epicbox instances are started by default (epicbox1 and epicbox2).
 	- nginx will automatically route requests to available instances.
 
@@ -99,6 +106,9 @@ Epicbox Relay Server for Epic Cash, built with Node.js and Rust.
 All major settings can be configured via environment variables or a `.env` file:
 
 ```
+MONGO_ROOT_USER=root
+MONGO_ROOT_PASSWORD=<strong password>
+EPICBOX_DB_PASSWORD=<strong password>
 EPICBOX_DOMAIN=my.domain.com
 EPICBOX_PORT=443
 ```

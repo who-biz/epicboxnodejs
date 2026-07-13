@@ -170,3 +170,7 @@ compile_commands.json
 
 epicboxlib_source/target
 config.json
+
+
+# environment vars file
+.env

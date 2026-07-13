@@ -1,5 +1,4 @@
 {
-	"mongo_url": "mongodb://epicbox:epicboxpass@mongodb:27017/epicbox?authSource=epicbox",
 	"mongo_dbName": "epicbox",
 	"mongo_collection_name": "slates",
 	"epicbox_domain": "epicbox.your-domain.com",

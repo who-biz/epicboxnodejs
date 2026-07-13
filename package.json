@@ -1,17 +1,21 @@
 {
   "name": "epicboxnodejs",
-  "version": "1.0.0",
-  "description": "",
+  "version": "1.1.0",
+  "description": "Epicbox relay server",
   "main": "app_mongo.js",
   "scripts": {
     "start": "node app_mongo.js",
+    "audit": "npm audit --omit=dev",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "",
   "license": "ISC",
+  "engines": {
+    "node": ">=20.19.0"
+  },
   "dependencies": {
-    "mongodb": "^5.1.0",
-    "uid2": "^1.0.0",
-    "ws": "^8.12.1"
+    "mongodb": "7.5.0",
+    "uid2": "1.0.0",
+    "ws": "8.21.0"
   }
 }
