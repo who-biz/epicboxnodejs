@@ -47,7 +47,7 @@ WORKDIR /usr/src/app
 # copy only the manifests first so this layer is cached until
 # package.json / package-lock.json change
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+RUN npm ci --omit=dev --ignore-scripts
 
 # runtime stages
 FROM node:22-bookworm-slim
@@ -65,24 +65,23 @@ RUN apt-get update && \
 ENV LANG=en_US.UTF-8 \
     NODE_ENV=production
 
-# dedicated non-root service user. app dir must be owned by the
-# user so the app/epicboxlib can write runtime files in the workdir
-RUN useradd -u 1001 -U -m -s /bin/bash epicsvcs && \
-    mkdir -p /usr/src/app && \
-    chown epicsvcs:epicsvcs /usr/src/app
+# dedicated non-root service user. app writes nothing to disk at runtime
+# so the workdir and all app files stay owned by root with epicsvcs granted 
+# read/execute only, compromised app process cannot modify anything
+RUN useradd -u 1001 -U -m -s /usr/sbin/nologin epicsvcs && \
+    mkdir -p /usr/src/app
 
 WORKDIR /usr/src/app
 
 # Pre-built node_modules from the deps stage
-COPY --from=node-deps --chown=epicsvcs:epicsvcs /usr/src/app/node_modules ./node_modules
-
-COPY --chown=epicsvcs:epicsvcs package.json app_mongo.js ./
+COPY --from=node-deps /usr/src/app/node_modules ./node_modules
+COPY --chmod=444 package.json app_mongo.js ./
 
 # default config shipped as config.json for app compatibility
-COPY --chown=epicsvcs:epicsvcs default_config.json ./config.json
+COPY --chmod=444 default_config.json ./config.json
 
 # compiled rust bin from the builder stage
-COPY --from=rust-builder --chown=epicsvcs:epicsvcs --chmod=755 /epicboxlib ./epicboxlib
+COPY --from=rust-builder --chmod=755 /epicboxlib ./epicboxlib
 
 USER epicsvcs
 

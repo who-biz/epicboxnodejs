@@ -1,7 +1,7 @@
 services:
   mongodb:
     #TODO: (Biz) needs discussion, or a automatic fix. Should we just use 7.0?
-    # we have an existing mongo_data volume created by 6.0, for all service providers.
+    # we have an existing mongo_data volume created by 6.0, for some service providers.
     # we cannot go 6.0 to 8.0 directly... need to step through 7.0 first.
     #
     # case is not handled yet but we can run mongo:7.0 once, setFeatureCompatibilityVersion "7.0",
@@ -9,6 +9,10 @@ services:
     image: mongo:8.0.26
     container_name: mongodb
     restart: always
+    # (cap_drop/read_only are NOT applied here. the entrypoint needs
+    # chown/setuid caps at startup and mongod writes to its volume
+    security_opt:
+      - no-new-privileges:true
     # mongo is only reachable on the internal compose network, ports section unnecessary
     environment:
       # no defaults here. compose should fail loudly if they are unset
@@ -35,6 +39,14 @@ services:
       dockerfile: epicbox/Dockerfile
     container_name: epicbox1
     restart: always
+    user: "epicsvcs"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
     environment:
       # password comes from env instead of old default
       - MONGO_URL=mongodb://epicbox:${EPICBOX_DB_PASSWORD:?set in .env}@mongodb:27017/epicbox?authSource=epicbox
@@ -55,6 +67,14 @@ services:
       dockerfile: epicbox/Dockerfile
     container_name: epicbox2
     restart: always
+    user: "epicsvcs"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
     environment:
       - MONGO_URL=mongodb://epicbox:${EPICBOX_DB_PASSWORD:?set in .env}@mongodb:27017/epicbox?authSource=epicbox
       - EPICBOX_INSTANCE_ID=2
@@ -67,16 +87,13 @@ services:
       - "127.0.0.1:8889:3423"
 
   nginx:
-    # Fable says we should ideally not use simply nginx:alpine tag. note below:
-    #
-    # For reproducible, supply-chain-safe deploys, pin this to the current stable tag or
-    # (better) a digest, e.g.:
-    #   image: nginx:alpine@sha256:<digest>
-    # Get the digest of the image you have vetted with:
-    #   docker inspect --format='{{index .RepoDigests 0}}' nginx:alpine
-    image: nginx:alpine
+    # note: nginx retires each stable branch every april. plan move to
+    # the 1.32 series around april 2027
+    image: nginx:1.30.3-alpine
     container_name: nginx
     restart: always
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "${NGINX_PORT:-8443}:443"
     # pass variables to the container
@@ -88,10 +105,6 @@ services:
     entrypoint: ["/bin/sh", "-c", "envsubst '$$EPICBOX_DOMAIN $$EPICBOX_PORT' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf && exec nginx -g 'daemon off;'"]
     volumes:
       - ./nginx/nginx.conf.template:/etc/nginx/nginx.conf.template:ro
-      # FABLE NOTE: nginx listens on 443 but no certificate volume is mounted in
-      # this file. If your template references ssl_certificate paths, mount
-      # them read-only, e.g.:
-      # - ./nginx/certs:/etc/nginx/certs:ro
     depends_on:
       - epicbox1
       - epicbox2
