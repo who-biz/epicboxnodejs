@@ -76,7 +76,7 @@ Epicbox Relay Server for Epic Cash, built with Node.js and Rust.
 	```sh
 	cp .env.example .env
 	```
-	Edit `.env` and set strong values for `MONGO_ROOT_USER`, `MONGO_ROOT_PASSWORD`, and `EPICBOX_DB_PASSWORD` (e.g. `openssl rand -base64 24`). Do not commit `.env`.
+	Edit `.env` and set strong values for `MONGO_ROOT_USER`, `MONGO_ROOT_PASSWORD`, and `EPICBOX_DB_PASSWORD` (e.g. `openssl rand -hex 48`)
 
 3. **Build and start all services with Docker Compose:**
 	```sh

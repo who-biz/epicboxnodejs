@@ -697,7 +697,8 @@ const canceltx = (ws, message) => {
                 ws.process_slate = false;
                 ws.sendslate_attempts = 0;
 
-                ws.send(JSON.stringify({type: "Ok"}));
+                ws.send(JSON.stringify({type: "TransactionCancelled", epicboxmsgid: slateid}));
+                //ws.send(JSON.stringify({type: "Ok"}));
             }).catch((err) => {
                 console.error("Error canceltx delete", err);
                 ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Cancel failed, try again."}));
