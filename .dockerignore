@@ -1,0 +1,23 @@
+# VCS
+.git
+.gitignore
+.gitmodules
+**/.git
+
+# not needed inside the image
+README.md
+Dockerfile*
+epicbox/Dockerfile*
+docker-compose.yml
+.dockerignore
+nginx/
+mongo-init.js
+
+# local installs, build artifacts
+node_modules
+npm-debug.log
+epicboxlib_source/target
+epicboxlib_source/**/target
+
+# note: epicboxlib_source itself must stay in the build context.
+# rust builder copies its sources from there

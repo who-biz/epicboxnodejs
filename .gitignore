@@ -24,6 +24,7 @@
 !.mailmap
 !.nycrc
 !.yamllint.yaml
+!.dockerignore
 
 # === Rules for root dir ===
 /core
