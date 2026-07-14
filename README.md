@@ -66,11 +66,9 @@ Epicbox Relay Server for Epic Cash, built with Node.js and Rust.
 
 ## Docker Quick Start
 
-1. **Clone the repository and initialize submodules:**
+1. **Clone the repository, recursively pulling in submodules:**
 	```sh
-	git clone <repo-url>
-	cd epicboxnodejs-source
-	git submodule update --init --recursive
+	git clone <repo-url> --recursive
 	```
 
 2. **Create your `.env` file (required):**
