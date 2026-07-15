@@ -1,11 +1,12 @@
 {
-	"mongo_dbName": "epicbox",
-	"mongo_collection_name": "slates",
-	"epicbox_domain": "epicbox.your-domain.com",
-	"epicbox_port": 443,
-	"local_epicbox_service_port": 3423,
-	"path_to_epicboxlib_exec_file": "./epicboxlib",
-	"challenge_interval": 60000,
-	"debug": false,
-	"stats": false
+        "mongo_dbName": "epicbox",
+        "mongo_collection_name": "slates",
+        "mongo_cancelled_collection_name": "cancelled_slates",
+        "epicbox_domain": "epicbox.whobiz.dev",
+        "epicbox_port": 443,
+        "local_epicbox_service_port": 3423,
+        "path_to_epicboxlib_exec_file": "./epicboxlib",
+        "challenge_interval": 60000,
+        "debug": false,
+        "stats": false
 }

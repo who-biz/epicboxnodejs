@@ -7,6 +7,8 @@
  db.slates.createIndex({queue:1, made:1, createdat: 1});
  db.slates.createIndex({messageid:1, made:1});
  db.slates.createIndex({ "createdat": 1 }, {expireAfterSeconds: 604800 });
+ db.cancelled_slates.createIndex({ messageid: 1 });
+ db.cancelled_slates.createIndex({ "cancelledat": 1 }, { expireAfterSeconds: 604800 });
  db.createUser(
   {
     user: "epicbox",
@@ -57,6 +59,12 @@ const config = {
 };
 let mongoclient = null;
 let collection = null;
+let mongoclient = null;
+let collection = null;
+// tombstones for canceled slates. allows for recovery from lost
+// TransactionCancelled response. can be re-requested orre-confirmed
+let cancelledCollection = null;
+
 let statistics = {
 
   from: new Date(),
@@ -627,12 +635,12 @@ const made = (ws, message) => {
  participant cancels a queued tx by its slate/message id.
  The relay cannot look inside encrypted slatepack payloads, so the
  addressable handle is the epicbox message id (the same id clients receive
- as `epicboxmsgid` with every slate). Stateless with respect to slatepack
+ as epicboxmsgid with every slate). Stateless with respect to slatepack
  negotiation steps: we only clear the queued slate from the DB.
 
  The requester must also be a participant of the tx (recipient queue or
  sender replyto); otherwise we answer a generic Ok so canceltx cannot be
- used to probe which message ids exist on the relay..
+ used to probe which message ids exist on the relay
 
  @param {object} ws  - Client socket
  @param {json} message - { type: "canceltx", slateid: "<32-char epicboxmsgid>", signature: "<sig over id>" }
@@ -669,36 +677,59 @@ const canceltx = (ws, message) => {
             return ws.send(JSON.stringify({type: "Error", kind: "InvalidSignature", description: "Invalid signature."}));
         }
 
-        // fetch first, then authorize in JS: the requester must be a
+        // fetch first, then authorize in JS. the requester must be a
         // participant of the tx. queue holds the recipient public key,
-        // replyto holds the sender address (publickey or publickey@domain).
+        // replyto holds the sender address
         collection.findOne({ messageid: slateid }).then((dbslate) => {
 
-            const isParticipant = dbslate != null && (
-                dbslate.queue === ws.epicPublicAddress ||
-                dbslate.replyto === ws.epicPublicAddress ||
-                (typeof dbslate.replyto === 'string' && dbslate.replyto.split('@')[0] === ws.epicPublicAddress)
+            // participant test works for live records and tombstones alike:
+            // queue holds the recipient public key, replyto the sender address
+            const participantOf = (rec) => rec != null && (
+                rec.queue === ws.epicPublicAddress ||
+                rec.replyto === ws.epicPublicAddress ||
+                (typeof rec.replyto === 'string' && rec.replyto.split('@')[0] === ws.epicPublicAddress)
             );
 
-            if (!isParticipant) {
-                // identical response whether the id is unknown or belongs to
-                // someone else, avoiding existence probing
-                console.log("canceltx: no matching slate for", ws.epicPublicAddress, slateid);
-                return ws.send(JSON.stringify({type: "Ok"}));
+            if (!participantOf(dbslate)) {
+                // no db slate for this requester. check tombstones so
+                // verified participants can re-confirm
+                cancelledCollection.findOne({ messageid: slateid }).then((tomb) => {
+                    if (participantOf(tomb)) {
+                        console.log("canceltx: re-confirm from tombstone", slateid, "for", ws.epicPublicAddress);
+                        return ws.send(JSON.stringify({type: "TransactionCancelled", epicboxmsgid: slateid}));
+                    }
+                    // identical response whether the id is unknown or belongs to
+                    // someone else, avoiding existence probing
+                    console.log("canceltx: no matching slate for", ws.epicPublicAddress, slateid);
+                    return ws.send(JSON.stringify({type: "Ok"}));
+                }).catch((err) => {
+                    console.error("Error canceltx tombstone lookup", err);
+                    // ambiguous error intentionally
+                    // tombstone outage can't be used to probe
+                    ws.send(JSON.stringify({type: "Ok"}));
+                });
+                return;
             }
+
+            // write the tombstone before deleting, to tolerate crash between the request/resp
+            cancelledCollection.insertOne({
+                messageid: slateid,
+                queue: dbslate.queue,
+                replyto: dbslate.replyto,
+                cancelledat: new Date()
+            }).catch((err) => console.error("Error insert tombstone", err));
 
             collection.deleteOne({ _id: dbslate._id }).then((delResult) => {
                 console.log("canceltx: deleted", slateid, "for", ws.epicPublicAddress);
                 config.debugMessage ? console.log("DB delete result", delResult) : null;
 
-                // if this socket was blocked waiting on that very slate,
-                // unblock it so the next challenge->subscribe cycle can
-                // deliver the next queued slate
+                // if socket was blocked, unblock it so the next challenge/subscribe cycle
+                // may deliver the next queued slate
                 ws.process_slate = false;
                 ws.sendslate_attempts = 0;
 
+                // positive confirmation. this is the only wallet local-cancel trigger.
                 ws.send(JSON.stringify({type: "TransactionCancelled", epicboxmsgid: slateid}));
-                //ws.send(JSON.stringify({type: "Ok"}));
             }).catch((err) => {
                 console.error("Error canceltx delete", err);
                 ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Cancel failed, try again."}));
@@ -708,7 +739,6 @@ const canceltx = (ws, message) => {
             console.error("Error canceltx lookup", err);
             ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Cancel failed, try again."}));
         });
-    });
 }
 
 
@@ -874,6 +904,7 @@ const loadConfig = async (filePath) => {
         config.pathtoepicboxlib = process.env.PATH_TO_EPICBOXLIB_EXEC_FILE || data.path_to_epicboxlib_exec_file || config.pathtoepicboxlib;
         config.db_name = process.env.MONGO_DBNAME || data.mongo_dbName || config.db_name;
         config.collection_name = process.env.MONGO_COLLECTION_NAME || data.mongo_collection_name || config.collection_name;
+        config.cancelled_collection_name = process.env.MONGO_CANCELLED_COLLECTION_NAME || data.mongo_cancelled_collection_name || config.cancelled_collection_name;
 
         // env vars are strings, convert to number for interval math
         config.challenge_interval = Number(process.env.CHALLENGE_INTERVAL || data.challenge_interval || config.challenge_interval);
@@ -897,6 +928,7 @@ const startEpicbox = async () => {
     });
     let db = mongoclient.db(config.db_name);
     collection = db.collection(config.collection_name);
+    cancelledCollection = db.collection(config.cancelled_collection_name);
     await mongoclient.connect();
     console.log('Connected successfully to MongoDB');
     server.listen(config.localepicboxserviceport);
