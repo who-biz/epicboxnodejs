@@ -657,10 +657,10 @@ const canceltx = (ws, message) => {
     const slateid = typeof message.slateid === 'string' ? message.slateid
                   : (typeof message.epicboxmsgid === 'string' ? message.epicboxmsgid : null);
 
-    // epicbox message ids are uid(32) and exactly 32 alphanumeric chars.
-    // Wallet slate UUIDs are a different identifier the relay cannot
+    // epicbox message ids are uid(32): exactly 32 chars from [A-Za-z0-9_-]
+    // wallet slate UUIDs are a different identifier the relay cannot
     // resolve or track due to encryption. Other formats are rejected
-    if (slateid === null || !/^[A-Za-z0-9]{32}$/.test(slateid)) {
+    if (slateid === null || !/^[A-Za-z0-9_-]{32}$/.test(slateid)) {
         return ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Invalid id: expected the 32-char epicboxmsgid, not the wallet slate UUID."}));
     }
 
