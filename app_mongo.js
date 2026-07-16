@@ -59,8 +59,6 @@ const config = {
 };
 let mongoclient = null;
 let collection = null;
-let mongoclient = null;
-let collection = null;
 // tombstones for canceled slates. allows for recovery from lost
 // TransactionCancelled response. can be re-requested orre-confirmed
 let cancelledCollection = null;
@@ -711,36 +709,49 @@ const canceltx = (ws, message) => {
                 return;
             }
 
-            // write the tombstone before deleting, to tolerate crash between the request/resp
-            cancelledCollection.insertOne({
-                messageid: slateid,
-                queue: dbslate.queue,
-                replyto: dbslate.replyto,
-                cancelledat: new Date()
-            }).catch((err) => console.error("Error insert tombstone", err));
+            // upsert keyed on messageid so a retry after a failed delete
+            // re-uses the existing tombstone instead of inserting a duplicate.
+            // setOnInsert keeps the original cancelledat on re-runs
+            cancelledCollection.updateOne(
+                { messageid: slateid },
+                { $setOnInsert: {
+                    messageid: slateid,
+                    queue: dbslate.queue,
+                    replyto: dbslate.replyto,
+                    cancelledat: new Date()
+                }},
+                { upsert: true }
+            ).then(() => {
 
-            collection.deleteOne({ _id: dbslate._id }).then((delResult) => {
-                console.log("canceltx: deleted", slateid, "for", ws.epicPublicAddress);
-                config.debugMessage ? console.log("DB delete result", delResult) : null;
+                // delete only runs once the tombstone is durably written,
+                // so a crash between the two can never lose the record
+                collection.deleteOne({ _id: dbslate._id }).then((delResult) => {
+                    console.log("canceltx: deleted", slateid, "for", ws.epicPublicAddress);
+                    config.debugMessage ? console.log("DB delete result", delResult) : null;
 
-                // if socket was blocked, unblock it so the next challenge/subscribe cycle
-                // may deliver the next queued slate
-                ws.process_slate = false;
-                ws.sendslate_attempts = 0;
+                    // if socket was blocked, unblock it so the next challenge/subscribe cycle
+                    // may deliver the next queued slate
+                    ws.process_slate = false;
+                    ws.sendslate_attempts = 0;
 
-                // positive confirmation. this is the only wallet local-cancel trigger.
-                ws.send(JSON.stringify({type: "TransactionCancelled", epicboxmsgid: slateid}));
+                    // positive confirmation. this is the only wallet local-cancel trigger
+                    ws.send(JSON.stringify({type: "TransactionCancelled", epicboxmsgid: slateid}));
+                }).catch((err) => {
+                    console.error("Error canceltx delete", err);
+                    ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Cancel failed: could not remove slate, try again."}));
+                });
+
             }).catch((err) => {
-                console.error("Error canceltx delete", err);
-                ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Cancel failed, try again."}));
+                console.error("Error canceltx tombstone write", err);
+                ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Cancel failed: could not record cancellation, try again."}));
             });
 
         }).catch((err) => {
             console.error("Error canceltx lookup", err);
-            ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Cancel failed, try again."}));
+            ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Cancel failed: lookup error, try again."}));
         });
+    });
 }
-
 
 /*
  store tx in db or forward to foreign epicbox
