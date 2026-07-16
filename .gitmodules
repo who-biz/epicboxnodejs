@@ -1,3 +1,4 @@
 [submodule "epicboxlib_source/epic-wallet"]
 	path = epicboxlib_source/epic-wallet
-	url = https://github.com/EpicCash/epic-wallet.git
+	url = https://github.com/who-biz/epic-wallet.git
+	branch = ebox-cancel-txs
