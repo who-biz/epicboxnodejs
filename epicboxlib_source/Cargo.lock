@@ -804,8 +804,8 @@ dependencies = [
 
 [[package]]
 name = "epic_api"
-version = "4.0.0"
-source = "git+https://github.com/EpicCash/epic.git?branch=master#5f5e907a6da78407633ef8a5f04596a8e4b56730"
+version = "4.0.3"
+source = "git+https://github.com/who-biz/epic.git?branch=randomx-api-fix#c4b9aad1e239715da74f8c110986d67770439e78"
 dependencies = [
  "bytes 1.11.0",
  "chrono",
@@ -845,8 +845,8 @@ dependencies = [
 
 [[package]]
 name = "epic_chain"
-version = "4.0.0"
-source = "git+https://github.com/EpicCash/epic.git?branch=master#5f5e907a6da78407633ef8a5f04596a8e4b56730"
+version = "4.0.3"
+source = "git+https://github.com/who-biz/epic.git?branch=randomx-api-fix#c4b9aad1e239715da74f8c110986d67770439e78"
 dependencies = [
  "bit-vec",
  "bitflags 2.10.0",
@@ -868,8 +868,8 @@ dependencies = [
 
 [[package]]
 name = "epic_core"
-version = "4.0.0"
-source = "git+https://github.com/EpicCash/epic.git?branch=master#5f5e907a6da78407633ef8a5f04596a8e4b56730"
+version = "4.0.3"
+source = "git+https://github.com/who-biz/epic.git?branch=randomx-api-fix#c4b9aad1e239715da74f8c110986d67770439e78"
 dependencies = [
  "blake2-rfc",
  "byteorder",
@@ -900,8 +900,8 @@ dependencies = [
 
 [[package]]
 name = "epic_keychain"
-version = "4.0.0"
-source = "git+https://github.com/EpicCash/epic.git?branch=master#5f5e907a6da78407633ef8a5f04596a8e4b56730"
+version = "4.0.3"
+source = "git+https://github.com/who-biz/epic.git?branch=randomx-api-fix#c4b9aad1e239715da74f8c110986d67770439e78"
 dependencies = [
  "blake2-rfc",
  "byteorder",
@@ -924,8 +924,8 @@ dependencies = [
 
 [[package]]
 name = "epic_p2p"
-version = "4.0.0"
-source = "git+https://github.com/EpicCash/epic.git?branch=master#5f5e907a6da78407633ef8a5f04596a8e4b56730"
+version = "4.0.3"
+source = "git+https://github.com/who-biz/epic.git?branch=randomx-api-fix#c4b9aad1e239715da74f8c110986d67770439e78"
 dependencies = [
  "bitflags 2.10.0",
  "blake2-rfc",
@@ -956,8 +956,8 @@ dependencies = [
 
 [[package]]
 name = "epic_pool"
-version = "4.0.0"
-source = "git+https://github.com/EpicCash/epic.git?branch=master#5f5e907a6da78407633ef8a5f04596a8e4b56730"
+version = "4.0.3"
+source = "git+https://github.com/who-biz/epic.git?branch=randomx-api-fix#c4b9aad1e239715da74f8c110986d67770439e78"
 dependencies = [
  "blake2-rfc",
  "chrono",
@@ -974,8 +974,8 @@ dependencies = [
 
 [[package]]
 name = "epic_store"
-version = "4.0.0"
-source = "git+https://github.com/EpicCash/epic.git?branch=master#5f5e907a6da78407633ef8a5f04596a8e4b56730"
+version = "4.0.3"
+source = "git+https://github.com/who-biz/epic.git?branch=randomx-api-fix#c4b9aad1e239715da74f8c110986d67770439e78"
 dependencies = [
  "byteorder",
  "croaring",
@@ -994,8 +994,8 @@ dependencies = [
 
 [[package]]
 name = "epic_util"
-version = "4.0.0"
-source = "git+https://github.com/EpicCash/epic.git?branch=master#5f5e907a6da78407633ef8a5f04596a8e4b56730"
+version = "4.0.3"
+source = "git+https://github.com/who-biz/epic.git?branch=randomx-api-fix#c4b9aad1e239715da74f8c110986d67770439e78"
 dependencies = [
  "anyhow",
  "backtrace",
@@ -1439,8 +1439,8 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "grin_secp256k1zkp"
-version = "0.8.0"
-source = "git+https://github.com/EpicCash/rust-secp256k1-zkp?branch=master#e5ee7524f144b9d5fbc6c8a11c0f4967d474ec40"
+version = "0.8.1"
+source = "git+https://github.com/EpicCash/rust-secp256k1-zkp?branch=master#42fcb29d4b635ea771d1984be0d11b0e64b15a93"
 dependencies = [
  "arrayvec 0.7.6",
  "cc",
@@ -2947,7 +2947,7 @@ dependencies = [
 [[package]]
 name = "randomx"
 version = "0.2.0"
-source = "git+https://github.com/EpicCash/randomx-rust.git?tag=v0.2.0#d8cdeff53c333707da401a3e06d29b467681cfeb"
+source = "git+https://github.com/who-biz/randomx-rust.git?branch=cs-fixes#e5174e7814551d161af4e64e4d7c2c2f1abb177a"
 dependencies = [
  "bindgen",
  "byteorder",
