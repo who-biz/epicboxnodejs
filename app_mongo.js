@@ -4,10 +4,19 @@
 /*
 
 
- db.slates.createIndex({queue:1, made:1, createdat: 1});
- db.slates.createIndex({messageid:1, made:1});
- db.slates.createIndex({ "createdat": 1 }, {expireAfterSeconds: 604800 });
- db.cancelled_slates.createIndex({ messageid: 1 });
+ db.slates.createIndex({ queue: 1, made: 1, createdat: 1 });
+ db.slates.createIndex({ messageid: 1, made: 1 });
+ db.slates.createIndex({ epicboxtxid: 1, made: 1 });
+ db.slates.createIndex({ route: 1, epicboxtxid: 1 });
+ db.slates.createIndex({ "createdat": 1 }, { expireAfterSeconds: 604800 });
+ db.cancelled_slates.createIndex(
+  { epicboxtxid: 1 },
+  {
+   unique: true,
+   partialFilterExpression: { epicboxtxid: { $type: "string" } }
+  }
+ );
+ db.cancelled_slates.createIndex({ participants: 1, cancelledat: 1 });
  db.cancelled_slates.createIndex({ "cancelledat": 1 }, { expireAfterSeconds: 604800 });
  db.createUser(
   {
@@ -41,6 +50,9 @@ const protver = "3.0.0";
 const static_challenge = "7WUDtkSaKyGRUnQ22rE3QUXChV8DmA6NnunDYP4vheTpc";
 // used to reference client socket (ws) to public address (epic address) for slate passthroughs
 const clients_publicaddress = {};
+// Prevent a server-to-server CancelTx from looping while the original
+// cancellation is still being processed.
+const activeCancellations = new Set();
 const config = {
     mongourl: "mongodb://127.0.0.1:27019",
     epicbox_domain: process.env.EPICBOX_DOMAIN || "epicbox.your-domain.com",
@@ -49,6 +61,7 @@ const config = {
     pathtoepicboxlib: "./epicboxlib",
     db_name: "epicbox",
     collection_name: "slates",
+    cancelled_collection_name: "cancelled_slates",
     challenge_interval: 60000, // milliseconds
     debugMessage: true,
     stats: false,
@@ -201,6 +214,8 @@ wss.on('connection', (ws, req) => {
     ws.sendslate_attempts = 0;
     ws.max_sendslate_attempts = 0;
     ws.pending_challenge = false;
+    // Tombstones are re-delivered after reconnect, but only once per socket.
+    ws.sent_cancelled_txids = new Set();
     ws.client_details = {
         wallet_version: '',
         wallet_mode: '',
@@ -282,7 +297,7 @@ wss.on('connection', (ws, req) => {
             case "made":
                 made(ws, message);
             break;
-            // participant cancels a queued tx by its slate/message id
+            // participant cancels every queued state by its stable epicboxtxid
             case "canceltx":
                 canceltx(ws, message);
             break;
@@ -343,6 +358,319 @@ const payloadToString = (payload) => {
     return Buffer.from(payload).toString('utf8'); // Buffer / Uint8Array
 }
 
+
+const EPICBOX_ID_RE = /^[A-Za-z0-9_-]{32}$/;
+
+const isEpicboxId = (value) => (
+    typeof value === "string" && EPICBOX_ID_RE.test(value)
+);
+
+const publicKeyFromAddress = (address) => {
+    if (typeof address !== "string") return null;
+    return address.split("@")[0] || null;
+};
+
+const endpointFromAddress = (address) => {
+    if (typeof address !== "string") return null;
+
+    const at = address.lastIndexOf("@");
+    if (at === -1 || at === address.length - 1) return null;
+
+    const endpoint = address.slice(at + 1);
+    const colon = endpoint.lastIndexOf(":");
+
+    if (colon > -1 && /^\d+$/.test(endpoint.slice(colon + 1))) {
+        return {
+            domain: endpoint.slice(0, colon),
+            port: Number(endpoint.slice(colon + 1))
+        };
+    }
+
+    return { domain: endpoint, port: 443 };
+};
+
+const relayIdentity = (domain, port) => `${domain}:${String(port)}`;
+
+const currentRelayIdentity = () => relayIdentity(
+    config.epicbox_domain,
+    config.epicbox_port
+);
+
+const participantKeys = (records) => {
+    const keys = new Set();
+
+    for (const record of records) {
+        for (const value of [
+            record.queue,
+            record.replyto,
+            record.to,
+            record.local_address,
+            record.remote_address
+        ]) {
+            const key = publicKeyFromAddress(value);
+            if (key) keys.add(key);
+        }
+    }
+
+    return [...keys];
+};
+
+const recordHasParticipant = (record, publicKey) => (
+    record != null && participantKeys([record]).includes(publicKey)
+);
+
+const remoteRelayEndpoints = (records) => {
+    const endpoints = new Map();
+    const current = currentRelayIdentity();
+
+    const addEndpoint = (domain, port) => {
+        if (typeof domain !== "string" || domain.length === 0) return;
+
+        const normalizedPort = Number(port || 443);
+        const id = relayIdentity(domain, normalizedPort);
+        if (id === current) return;
+
+        endpoints.set(id, { domain, port: normalizedPort });
+    };
+
+    for (const record of records) {
+        addEndpoint(record.remote_domain, record.remote_port);
+
+        // Fallback for records created before explicit relay routing fields.
+        const replyEndpoint = endpointFromAddress(record.replyto);
+        if (replyEndpoint) {
+            addEndpoint(replyEndpoint.domain, replyEndpoint.port);
+        }
+
+        if (record.route === true) {
+            const toEndpoint = endpointFromAddress(record.to);
+            if (toEndpoint) {
+                addEndpoint(toEndpoint.domain, toEndpoint.port);
+            }
+        }
+    }
+
+    return [...endpoints.values()];
+};
+
+const cancellationResponse = (epicboxtxid) => ({
+    type: "TransactionCancelled",
+    epicboxtxid
+});
+
+const sendCancellationToLocalParticipants = (
+    epicboxtxid,
+    participants,
+    requesterSocket
+) => {
+    const response = JSON.stringify(cancellationResponse(epicboxtxid));
+
+    if (requesterSocket && requesterSocket.readyState === WebSocket.OPEN) {
+        requesterSocket.process_slate = false;
+        requesterSocket.sendslate_attempts = 0;
+        requesterSocket.send(response);
+        requesterSocket.sent_cancelled_txids?.add(epicboxtxid);
+    }
+
+    for (const participant of participants) {
+        const client = clients_publicaddress[participant];
+
+        if (
+            client &&
+            client !== requesterSocket &&
+            client.readyState === WebSocket.OPEN
+        ) {
+            client.process_slate = false;
+            client.sendslate_attempts = 0;
+            client.send(response);
+            client.sent_cancelled_txids?.add(epicboxtxid);
+        }
+    }
+};
+
+const sendPendingCancellation = async (ws) => {
+    const tombstone = await cancelledCollection.findOne(
+        {
+            participants: ws.epicPublicAddress,
+            epicboxtxid: { $nin: [...ws.sent_cancelled_txids] }
+        },
+        { sort: { cancelledat: 1 } }
+    );
+
+    if (!tombstone || !isEpicboxId(tombstone.epicboxtxid)) {
+        return false;
+    }
+
+    ws.process_slate = false;
+    ws.sendslate_attempts = 0;
+    ws.send(JSON.stringify(cancellationResponse(tombstone.epicboxtxid)));
+    ws.sent_cancelled_txids.add(tombstone.epicboxtxid);
+
+    return true;
+};
+
+const relayCancelToRemote = (
+    endpoint,
+    requester,
+    epicboxtxid,
+    signature,
+    cancelrequestid
+) => new Promise((resolve) => {
+    const sock = new WebSocket(
+        `wss://${endpoint.domain}:${endpoint.port}`,
+        {
+            handshakeTimeout: 10000,
+            maxPayload: config.ws_max_payload
+        }
+    );
+
+    let settled = false;
+    let requestSent = false;
+
+    const finish = (ok) => {
+        if (settled) return;
+
+        settled = true;
+        clearTimeout(timer);
+
+        if (sock.readyState === WebSocket.OPEN) {
+            sock.close(ok ? 1000 : 1011, ok ? "Cancel relayed." : "Cancel relay failed.");
+        }
+
+        resolve(ok);
+    };
+
+    const timer = setTimeout(() => {
+        console.error(
+            "Cancel relay timeout",
+            endpoint.domain,
+            endpoint.port,
+            epicboxtxid
+        );
+        finish(false);
+    }, 10000);
+
+    sock.on("error", (err) => {
+        console.error(
+            "Cancel relay socket error",
+            endpoint.domain,
+            endpoint.port,
+            err.message
+        );
+        finish(false);
+    });
+
+    sock.on("message", (data) => {
+        try {
+            const response = JSON.parse(data);
+
+            if (response.type === "Challenge") {
+                if (requestSent) return;
+                requestSent = true;
+
+                // The destination relay verifies the participant signature and
+                // checks that this address belongs to the transaction.
+                sock.send(JSON.stringify({
+                    type: "CancelTx",
+                    address: requester,
+                    epicboxtxid,
+                    signature,
+                    cancelrequestid
+                }));
+                return;
+            }
+
+            if (response.type === "TransactionCancelled") {
+                finish(response.epicboxtxid === epicboxtxid);
+                return;
+            }
+
+            if (response.type === "Error") {
+                console.error(
+                    "Remote relay rejected cancellation",
+                    endpoint.domain,
+                    response.kind,
+                    response.description
+                );
+                finish(false);
+            }
+        } catch (err) {
+            console.error("Error parsing remote cancellation response", err);
+            finish(false);
+        }
+    });
+});
+
+const sendNextPending = async (ws) => {
+    // Cancellation supersedes delivery of obsolete queued Slate states.
+    if (await sendPendingCancellation(ws)) return;
+
+    if (ws.process_slate !== false) {
+        ws.sendslate_attempts++;
+        ws.send(JSON.stringify({ type: "Ok" }));
+        return;
+    }
+
+    const records = await collection
+        .find({
+            queue: ws.epicPublicAddress,
+            made: false,
+            // route:true rows are metadata, not deliverable Slates.
+            route: { $ne: true }
+        })
+        .sort({ createdat: 1 })
+        .limit(1)
+        .toArray();
+
+    if (!records || records.length === 0) {
+        ws.send(JSON.stringify({ type: "Ok" }));
+        return;
+    }
+
+    if (config.stats) statistics.slatesAttempt++;
+
+    const dbslate = records[0];
+    const payload = JSON.parse(payloadToString(dbslate.payload));
+    const epicboxtxid = isEpicboxId(dbslate.epicboxtxid)
+        ? dbslate.epicboxtxid
+        : dbslate.messageid;
+
+    const slate = {
+        type: "Slate",
+        from: dbslate.replyto,
+        str: payload.str,
+        signature: payload.signature,
+        challenge: payload.challenge
+    };
+
+    if (ws.epicboxver === "2.0.0" || ws.epicboxver === "3.0.0") {
+        slate.epicboxmsgid = dbslate.messageid;
+        slate.epicboxtxid = epicboxtxid;
+        slate.ver = ws.epicboxver;
+    } else {
+        // Preserve legacy behavior for clients that did not advertise the
+        // versioned protocol and may reject unknown fields.
+        collection.updateOne(
+            { messageid: dbslate.messageid },
+            { $set: { made: true } }
+        ).catch((err) => console.error("Error updateOne", err));
+    }
+
+    ws.send(JSON.stringify(slate));
+    ws.process_slate = true;
+
+    console.log(
+        "Sent slate",
+        dbslate.messageid,
+        "for transaction",
+        epicboxtxid,
+        "to",
+        ws.epicPublicAddress
+    );
+
+    if (config.debugMessage) console.log(slate);
+};
+
 // safe wrapper around execFile(config.pathtoepicboxlib, ...)
 // The old code did (if (error) throw error) inside callback
 // i.e. uncaught exception in Node
@@ -401,124 +729,84 @@ const clientdetails = (ws, message) => {
 */
 const subscribe = (ws, message) => {
 
-    // set used epicbox protocol version
+    // Set the Epicbox protocol version used by this client.
     if (message.hasOwnProperty("ver")) {
         switch (message.ver) {
             case "2.0.0":
                 ws.epicboxver = "2.0.0";
             break;
             default:
-                // new version is
                 ws.epicboxver = "3.0.0";
             break;
         }
     }
 
-    // verify that client is the owner of the public key
-    epicboxlib(["verifysignature", message.address, ws.challenge, message.signature], (verified) => {
-
-        // if signature is OK
-        if (verified) {
-
-            if (config.stats) {
-                statistics.subscribeInHour++;
+    epicboxlib(
+        ["verifysignature", message.address, ws.challenge, message.signature],
+        (verified) => {
+            if (!verified) {
+                removeListenerMapping(ws);
+                ws.send(JSON.stringify({
+                    type: "Error",
+                    kind: "InvalidSignature",
+                    description: "Invalid signature."
+                }));
+                return;
             }
 
-            // client proved that he is the owner of the public address
+            if (config.stats) statistics.subscribeInHour++;
+
             ws.epicPublicAddress = message.address;
 
-            // add client listener for passthrough slates;
-            if (clients_publicaddress[ws.epicPublicAddress] == undefined && ws.client_details.wallet_mode == 'listener') {
+            if (
+                clients_publicaddress[ws.epicPublicAddress] === undefined &&
+                ws.client_details.wallet_mode === "listener"
+            ) {
                 clients_publicaddress[ws.epicPublicAddress] = ws;
             }
 
             ws.lastSubscriptionTime = getTimestamp();
             ws.pending_challenge = false;
 
-            // if at some case a made request was not send back from client
-            // we set 'process_slate' back to false after 3 successfully subscriptions
-            // and let the client try to process not made slates again.
-            // max resets are limited to 3 rounds.
-            if (ws.sendslate_attempts >= 3 && ws.max_sendslate_attempts <= 3) {
+            // If Made was not returned, permit redelivery after three
+            // successful subscription cycles.
+            if (
+                ws.sendslate_attempts >= 3 &&
+                ws.max_sendslate_attempts <= 3
+            ) {
                 ws.sendslate_attempts = 0;
                 ws.max_sendslate_attempts++;
                 ws.process_slate = false;
             }
 
-            // if it's not possible for client to process not made slates after 3 rounds (=9 attempts),
-            // then delete all not made slates from client in db
+            // After three reset rounds (nine attempts), remove only
+            // undeliverable Slate rows. Never remove route metadata here.
             if (ws.max_sendslate_attempts >= 3) {
-                collection.deleteMany({ queue: ws.epicPublicAddress, made: false })
-                    .catch((err) => console.error("Error deleteMany", err));
-                ws.sendslate_attempts = 0;
-                ws.max_sendslate_attempts = 0;
-                ws.process_slate = false;
-            }
-
-            // get not processed tx for client
-            // prevent sending same slate multible times
-            if (ws.process_slate == false) {
-                collection.find({ queue: ws.epicPublicAddress, made: false }).sort({ "createdat": 1 }).limit(1).toArray().then((res) => {
-
-                    if (res && res.length > 0) {
-
-                        if (config.stats) {
-                            statistics.slatesAttempt++;
-                        }
-
-                        let dbslate = res[0];
-                        let payload = JSON.parse(payloadToString(dbslate.payload));
-                        let slate = {
-                            type: "Slate",
-                            from: dbslate.replyto,
-                            str: payload.str,
-                            signature: payload.signature,
-                            challenge: payload.challenge,
-                            // Relay-generated identifier for this queued Slate.
-                            // The receiver stores this in its TxLogEntry.
-                            epicboxmsgid: dbslate.messageid,
-                        };
-
-                        if (ws.epicboxver == "2.0.0" || ws.epicboxver == "3.0.0") {
-                            slate.ver = ws.epicboxver;
-                        } else {
-                            collection.updateOne({ messageid: dbslate.messageid }, { $set: { made: true } })
-                                .catch((err) => console.error("Error updateOne", err));
-                        }
-
-                        //TODO: check if this was already send on previous interval to client but client does block
-                        // if client blocks, this will end in multible made requests
-                        // we must set a flag here if the slate to client was already send but client did not process yet for any reasons.
-
-                        ws.send(JSON.stringify(slate));
-                        ws.process_slate = true;
-                        console.log("Sent slate to", ws.epicPublicAddress);
-                        config.debugMessage ? console.log(slate) : null;
-
-                    } else {
-
-                        // no slate found but subscribe was ok
-                        ws.send(JSON.stringify({type:"Ok"}));
-
-                    }
-                    // end if result > 0
-
+                collection.deleteMany({
+                    queue: ws.epicPublicAddress,
+                    made: false,
+                    route: { $ne: true }
+                }).then(() => {
+                    ws.sendslate_attempts = 0;
+                    ws.max_sendslate_attempts = 0;
+                    ws.process_slate = false;
+                    return sendNextPending(ws);
                 }).catch((err) => {
-                    console.error("Error reading pending slates", err);
-                    ws.send(JSON.stringify({type:"Ok"}));
+                    console.error(
+                        "Error cleaning or reading pending Epicbox work",
+                        err
+                    );
+                    ws.send(JSON.stringify({ type: "Ok" }));
                 });
-            } else {
-                // send back some response
-                ws.sendslate_attempts++;
-                ws.send(JSON.stringify({type:"Ok"}));
+                return;
             }
 
-        } else {
-            // client cannot prove that he is the owner of the public address
-            removeListenerMapping(ws);
-            ws.send(JSON.stringify({type: "Error", kind: "InvalidSignature", description: "Invalid signature."}));
+            sendNextPending(ws).catch((err) => {
+                console.error("Error reading pending Epicbox work", err);
+                ws.send(JSON.stringify({ type: "Ok" }));
+            });
         }
-    });
+    );
 }
 
 
@@ -543,53 +831,143 @@ const unsubscribe = (ws) => {
  @param {json} message - Client message see epic wallet
 */
 const validatePostslate = (ws, message) => {
-
     try {
-        // validate expected string fields before use
-        if (typeof message.from !== 'string' || typeof message.to !== 'string' || typeof message.str !== 'string') {
-            return ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Missing fields."}));
+        if (
+            typeof message.from !== "string" ||
+            typeof message.to !== "string" ||
+            typeof message.str !== "string" ||
+            typeof message.signature !== "string"
+        ) {
+            return ws.send(JSON.stringify({
+                type: "Error",
+                kind: "InvalidRequest",
+                description: "Missing fields."
+            }));
         }
 
-        console.log("postslate from ", message.from, "to ", message.to);
+        console.log("postslate from", message.from, "to", message.to);
+        const publickey = publicKeyFromAddress(message.from);
 
-        let publickey = message.from.split('@');
-        publickey = publickey[0];
+        epicboxlib(
+            ["verifyaddress", message.from, message.to],
+            (addressOk) => {
+                if (!addressOk) {
+                    console.log(
+                        "Error validate address format",
+                        message.from,
+                        message.to
+                    );
+                    ws.send(JSON.stringify({
+                        type: "Error",
+                        kind: "InvalidRequest",
+                        description: `Wrong address format. From: ${message.from}, To: ${message.to}`
+                    }));
+                    return;
+                }
 
-        // use epicboxlib to verify address format
-        epicboxlib(['verifyaddress', message.from, message.to], (addressOk) => {
-
-            if (addressOk) {
-
-                // verify that the message we receive was signed from publickey
-                epicboxlib(["verifysignature", publickey, message.str, message.signature], (signatureOk) => {
-
-                    if (signatureOk) {
-
-                        if (config.stats) {
-                            statistics.slatesReceivedInHour++;
+                epicboxlib(
+                    ["verifysignature", publickey, message.str, message.signature],
+                    (signatureOk) => {
+                        if (!signatureOk) {
+                            console.log("Error postslate signature", publickey);
+                            ws.send(JSON.stringify({
+                                type: "Error",
+                                kind: "InvalidRequest",
+                                description: "Error postslate signature."
+                            }));
+                            return;
                         }
 
-                        postSlate(ws, message);
+                        const acceptPostSlate = () => {
+                            if (config.stats) statistics.slatesReceivedInHour++;
+                            postSlate(ws, message);
+                        };
 
-                    } else {
-                        console.log("Error postslate signature", publickey);
-                        ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Error postslate signature."}));
+                        // The first state has no stable relay ID yet; the
+                        // destination relay creates it.
+                        if (message.epicboxtxid === undefined) {
+                            acceptPostSlate();
+                            return;
+                        }
+
+                        if (!isEpicboxId(message.epicboxtxid)) {
+                            ws.send(JSON.stringify({
+                                type: "Error",
+                                kind: "InvalidRequest",
+                                description: "Invalid epicboxtxid."
+                            }));
+                            return;
+                        }
+
+                        if (typeof message.epicboxtxidsig !== "string") {
+                            ws.send(JSON.stringify({
+                                type: "Error",
+                                kind: "InvalidRequest",
+                                description: "Missing epicboxtxid signature."
+                            }));
+                            return;
+                        }
+
+                        epicboxlib(
+                            [
+                                "verifysignature",
+                                publickey,
+                                message.epicboxtxid,
+                                message.epicboxtxidsig
+                            ],
+                            (txidSignatureOk) => {
+                                if (!txidSignatureOk) {
+                                    ws.send(JSON.stringify({
+                                        type: "Error",
+                                        kind: "InvalidSignature",
+                                        description: "Invalid epicboxtxid signature."
+                                    }));
+                                    return;
+                                }
+
+                                // If this relay already knows A, require the
+                                // posting key to be one of its participants.
+                                collection.find({
+                                    epicboxtxid: message.epicboxtxid
+                                }).toArray().then((existingRecords) => {
+                                    if (
+                                        existingRecords.length > 0 &&
+                                        !participantKeys(existingRecords).includes(publickey)
+                                    ) {
+                                        ws.send(JSON.stringify({
+                                            type: "Error",
+                                            kind: "InvalidRequest",
+                                            description: "Posting address is not a participant of epicboxtxid."
+                                        }));
+                                        return;
+                                    }
+
+                                    acceptPostSlate();
+                                }).catch((err) => {
+                                    console.error(
+                                        "Error checking epicboxtxid participant",
+                                        err
+                                    );
+                                    ws.send(JSON.stringify({
+                                        type: "Error",
+                                        kind: "InvalidRequest",
+                                        description: "Unable to validate epicboxtxid."
+                                    }));
+                                });
+                            }
+                        );
                     }
-
-                });
-
-            } else {
-                console.log("Error validate address format", message.from, message.to);
-
-                ws.send(JSON.stringify({type:"Error", kind:"InvalidRequest", description: `Wrong address format. From: ${message.from}, To: ${message.to}`}));
-
+                );
             }
-        });
-
+        );
     } catch (err) {
         console.error("Error postslate", err);
+        ws.send(JSON.stringify({
+            type: "Error",
+            kind: "InvalidRequest",
+            description: "Error processing PostSlate."
+        }));
     }
-
 }
 
 /*
@@ -632,127 +1010,186 @@ const made = (ws, message) => {
 
 
 /*
- participant cancels a queued tx by its slate/message id.
- The relay cannot look inside encrypted slatepack payloads, so the
- addressable handle is the epicbox message id (the same id clients receive
- as epicboxmsgid with every slate). Stateless with respect to slatepack
- negotiation steps: we only clear the queued slate from the DB.
+ Cancel every queued Slate state associated with one stable epicboxtxid.
 
- The requester must also be a participant of the tx (recipient queue or
- sender replyto); otherwise we answer a generic Ok so canceltx cannot be
- used to probe which message ids exist on the relay
+ epicboxmsgid is a per-message Made acknowledgement handle. It is not used
+ for cancellation. CancelTx and TransactionCancelled use only epicboxtxid.
 
- @param {object} ws  - Client socket
- @param {json} message - { type: "canceltx", slateid: "<32-char epicboxmsgid>", signature: "<sig over id>" }
-                         (epicboxmsgid is accepted as an alias for slateid;
-                          wallet slate UUIDs are rejected - the relay cannot
-                          resolve them)
+ The requester must be a transaction participant. Unknown transaction IDs
+ and non-participants receive the same ambiguous Ok response to prevent
+ relay record probing.
+
+ @param {object} ws - Client or forwarding relay socket
+ @param {json} message - {
+     type: "CancelTx",
+     address: "<participant public key>",
+     epicboxtxid: "<32-char stable transaction id>",
+     signature: "<signature over epicboxtxid>",
+     cancelrequestid?: "<32-char relay loop guard>"
+ }
 */
 const canceltx = (ws, message) => {
+    // Wallets normally prove ownership through Subscribe. A relay forwarding
+    // a participant-signed cancellation supplies message.address instead.
+    const requester = ws.epicPublicAddress != null
+        ? ws.epicPublicAddress
+        : publicKeyFromAddress(message.address);
 
-    // must have proven address ownership in this session first
-    if (ws.epicPublicAddress == null) {
-        return ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Subscribe before canceltx."}));
+    if (requester == null) {
+        return ws.send(JSON.stringify({
+            type: "Error",
+            kind: "InvalidRequest",
+            description: "Missing cancellation address."
+        }));
     }
 
-    // accept slateid (preferred) or epicboxmsgid for symmetry with 'made'
-    const slateid = typeof message.slateid === 'string' ? message.slateid
-                  : (typeof message.epicboxmsgid === 'string' ? message.epicboxmsgid : null);
+    const epicboxtxid = isEpicboxId(message.epicboxtxid)
+        ? message.epicboxtxid
+        : null;
 
-    // epicbox message ids are uid(32): exactly 32 chars from [A-Za-z0-9_-]
-    // wallet slate UUIDs are a different identifier the relay cannot
-    // resolve or track due to encryption. Other formats are rejected
-    if (slateid === null || !/^[A-Za-z0-9_-]{32}$/.test(slateid)) {
-        return ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Invalid id: expected the 32-char epicboxmsgid, not the wallet slate UUID."}));
+    if (epicboxtxid === null) {
+        return ws.send(JSON.stringify({
+            type: "Error",
+            kind: "InvalidRequest",
+            description: "Invalid or missing 32-character epicboxtxid."
+        }));
     }
 
-    if (typeof message.signature !== 'string') {
-        return ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Missing signature."}));
+    if (typeof message.signature !== "string") {
+        return ws.send(JSON.stringify({
+            type: "Error",
+            kind: "InvalidRequest",
+            description: "Missing signature."
+        }));
     }
 
-    // verify signature
-    epicboxlib(["verifysignature", ws.epicPublicAddress, slateid, message.signature], (verified) => {
-
-        if (!verified) {
-            return ws.send(JSON.stringify({type: "Error", kind: "InvalidSignature", description: "Invalid signature."}));
-        }
-
-        // fetch first, then authorize in JS. the requester must be a
-        // participant of the tx. queue holds the recipient public key,
-        // replyto holds the sender address
-        collection.findOne({ messageid: slateid }).then((dbslate) => {
-
-            // participant test works for live records and tombstones alike:
-            // queue holds the recipient public key, replyto the sender address
-            const participantOf = (rec) => rec != null && (
-                rec.queue === ws.epicPublicAddress ||
-                rec.replyto === ws.epicPublicAddress ||
-                (typeof rec.replyto === 'string' && rec.replyto.split('@')[0] === ws.epicPublicAddress)
-            );
-
-            if (!participantOf(dbslate)) {
-                // no db slate for this requester. check tombstones so
-                // verified participants can re-confirm
-                cancelledCollection.findOne({ messageid: slateid }).then((tomb) => {
-                    if (participantOf(tomb)) {
-                        console.log("canceltx: re-confirm from tombstone", slateid, "for", ws.epicPublicAddress);
-                        return ws.send(JSON.stringify({type: "TransactionCancelled", epicboxmsgid: slateid}));
-                    }
-                    // identical response whether the id is unknown or belongs to
-                    // someone else, avoiding existence probing
-                    console.log("canceltx: no matching slate for", ws.epicPublicAddress, slateid);
-                    return ws.send(JSON.stringify({type: "Ok"}));
-                }).catch((err) => {
-                    console.error("Error canceltx tombstone lookup", err);
-                    // ambiguous error intentionally
-                    // tombstone outage can't be used to probe
-                    ws.send(JSON.stringify({type: "Ok"}));
-                });
+    epicboxlib(
+        ["verifysignature", requester, epicboxtxid, message.signature],
+        async (verified) => {
+            if (!verified) {
+                ws.send(JSON.stringify({
+                    type: "Error",
+                    kind: "InvalidSignature",
+                    description: "Invalid signature."
+                }));
                 return;
             }
 
-            // upsert keyed on messageid so a retry after a failed delete
-            // re-uses the existing tombstone instead of inserting a duplicate.
-            // setOnInsert keeps the original cancelledat on re-runs
-            cancelledCollection.updateOne(
-                { messageid: slateid },
-                { $setOnInsert: {
-                    messageid: slateid,
-                    queue: dbslate.queue,
-                    replyto: dbslate.replyto,
-                    cancelledat: new Date()
-                }},
-                { upsert: true }
-            ).then(() => {
-
-                // delete only runs once the tombstone is durably written,
-                // so a crash between the two can never lose the record
-                collection.deleteOne({ _id: dbslate._id }).then((delResult) => {
-                    console.log("canceltx: deleted", slateid, "for", ws.epicPublicAddress);
-                    config.debugMessage ? console.log("DB delete result", delResult) : null;
-
-                    // if socket was blocked, unblock it so the next challenge/subscribe cycle
-                    // may deliver the next queued slate
-                    ws.process_slate = false;
-                    ws.sendslate_attempts = 0;
-
-                    // positive confirmation. this is the only wallet local-cancel trigger
-                    ws.send(JSON.stringify({type: "TransactionCancelled", epicboxmsgid: slateid}));
-                }).catch((err) => {
-                    console.error("Error canceltx delete", err);
-                    ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Cancel failed: could not remove slate, try again."}));
+            try {
+                const tombstone = await cancelledCollection.findOne({
+                    epicboxtxid
                 });
 
-            }).catch((err) => {
-                console.error("Error canceltx tombstone write", err);
-                ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Cancel failed: could not record cancellation, try again."}));
-            });
+                if (tombstone) {
+                    const participants = Array.isArray(tombstone.participants)
+                        ? tombstone.participants
+                        : participantKeys([tombstone]);
 
-        }).catch((err) => {
-            console.error("Error canceltx lookup", err);
-            ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Cancel failed: lookup error, try again."}));
-        });
-    });
+                    if (participants.includes(requester)) {
+                        ws.send(JSON.stringify(cancellationResponse(epicboxtxid)));
+                    } else {
+                        // Do not disclose another transaction's existence.
+                        ws.send(JSON.stringify({ type: "Ok" }));
+                    }
+                    return;
+                }
+
+                const records = await collection.find({ epicboxtxid }).toArray();
+
+                if (!records || records.length === 0) {
+                    console.log(
+                        "canceltx: no matching transaction for",
+                        requester,
+                        epicboxtxid
+                    );
+                    ws.send(JSON.stringify({ type: "Ok" }));
+                    return;
+                }
+
+                const participants = participantKeys(records);
+                if (!participants.includes(requester)) {
+                    ws.send(JSON.stringify({ type: "Ok" }));
+                    return;
+                }
+
+                const cancelrequestid = isEpicboxId(message.cancelrequestid)
+                    ? message.cancelrequestid
+                    : uid(32);
+                const activeKey = `${epicboxtxid}:${cancelrequestid}`;
+
+                // A remote relay may route this request back to its source.
+                // Confirm the in-flight request instead of recursing.
+                if (activeCancellations.has(activeKey)) {
+                    ws.send(JSON.stringify(cancellationResponse(epicboxtxid)));
+                    return;
+                }
+
+                activeCancellations.add(activeKey);
+
+                try {
+                    const remoteEndpoints = remoteRelayEndpoints(records);
+                    const remoteResults = await Promise.all(
+                        remoteEndpoints.map((endpoint) => relayCancelToRemote(
+                            endpoint,
+                            requester,
+                            epicboxtxid,
+                            message.signature,
+                            cancelrequestid
+                        ))
+                    );
+
+                    if (remoteResults.some((confirmed) => !confirmed)) {
+                        ws.send(JSON.stringify({
+                            type: "Error",
+                            kind: "InvalidRequest",
+                            description: "Cancel failed on a participant relay; try again."
+                        }));
+                        return;
+                    }
+
+                    // Record the transaction-wide tombstone before deleting
+                    // any individual Slate states.
+                    await cancelledCollection.updateOne(
+                        { epicboxtxid },
+                        {
+                            $setOnInsert: {
+                                epicboxtxid,
+                                participants,
+                                cancelledat: new Date()
+                            }
+                        },
+                        { upsert: true }
+                    );
+
+                    const deleteResult = await collection.deleteMany({
+                        epicboxtxid
+                    });
+
+                    console.log(
+                        "canceltx: deleted",
+                        deleteResult.deletedCount,
+                        "state records for",
+                        epicboxtxid
+                    );
+
+                    sendCancellationToLocalParticipants(
+                        epicboxtxid,
+                        participants,
+                        ws
+                    );
+                } finally {
+                    activeCancellations.delete(activeKey);
+                }
+            } catch (err) {
+                console.error("Error cancelling transaction", err);
+                ws.send(JSON.stringify({
+                    type: "Error",
+                    kind: "InvalidRequest",
+                    description: "Cancel failed; try again."
+                }));
+            }
+        }
+    );
 }
 
 /*
@@ -762,141 +1199,164 @@ const canceltx = (ws, message) => {
  @param {json} message - Client message see epic wallet
 */
 const postSlate = async (ws, json) => {
+    let str;
 
-    let str = {};
     try {
         str = JSON.parse(json.str);
     } catch (err) {
         console.log("Error parsing message string", err);
-        return;
+        return ws.send(JSON.stringify({
+            type: "Error",
+            kind: "InvalidRequest",
+            description: "Invalid Slate payload."
+        }));
     }
-
-    // guard destination shape before access of property
-    if (!str || typeof str !== 'object' || !str.destination || typeof str.destination.public_key !== 'string' || typeof str.destination.domain !== 'string') {
-        return ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: "Invalid slate destination."}));
-    }
-
-    let addressto = {};
-    addressto.publicKey = str.destination.public_key;
-    addressto.domain = str.destination.domain;
-    addressto.port = str.destination.port != null ? str.destination.port : 443;
 
     if (
-            addressto.domain === config.epicbox_domain &&
-            String(addressto.port) === String(config.epicbox_port)
+        !str ||
+        typeof str !== "object" ||
+        !str.destination ||
+        typeof str.destination.public_key !== "string" ||
+        typeof str.destination.domain !== "string"
     ) {
+        return ws.send(JSON.stringify({
+            type: "Error",
+            kind: "InvalidRequest",
+            description: "Invalid slate destination."
+        }));
+    }
 
-        // challenge is not required, we keep it for backward compatibility
-        let signed_payload = JSON.stringify({str: json.str, challenge: "", signature: json.signature});
-        let messageid = uid(32);
+    const addressto = {
+        publicKey: str.destination.public_key,
+        domain: str.destination.domain,
+        port: str.destination.port != null ? str.destination.port : 443
+    };
+
+    const isLocalDestination = (
+        addressto.domain === config.epicbox_domain &&
+        String(addressto.port) === String(config.epicbox_port)
+    );
+
+    if (isLocalDestination) {
+        const signedPayload = JSON.stringify({
+            str: json.str,
+            challenge: "",
+            signature: json.signature
+        });
+
+        // M_n is unique to this queued Slate; A is stable for the transaction.
+        const messageid = uid(32);
+        const epicboxtxid = isEpicboxId(json.epicboxtxid)
+            ? json.epicboxtxid
+            : messageid;
+        const sourceEndpoint = endpointFromAddress(json.from);
 
         try {
-            // persist the before exposing its msgid. guarantees that a 
-            // subsequent cancel-tx can resolve it.
             await collection.insertOne({
                 queue: addressto.publicKey,
                 made: false,
-                payload: Buffer.from(signed_payload),
+                route: false,
+                payload: Buffer.from(signedPayload),
                 replyto: json.from,
+                to: json.to,
                 createdat: new Date(),
                 expiration: 86400000,
-                messageid: messageid
+                messageid,
+                epicboxtxid,
+                epicboxtxidsig: json.epicboxtxidsig,
+                remote_domain: sourceEndpoint?.domain,
+                remote_port: sourceEndpoint?.port
             });
         } catch (err) {
             console.error("Error insert to db", err);
             return ws.send(JSON.stringify({
                 type: "Error",
-                kind: "StorageError",
+                kind: "InvalidRequest",
                 description: "Unable to queue Slate."
             }));
         }
 
-        let receiver = clients_publicaddress[addressto.publicKey];
+        const response = {
+            type: "Ok",
+            epicboxmsgid: messageid,
+            epicboxtxid
+        };
+        const receiver = clients_publicaddress[addressto.publicKey];
 
         if (
-            receiver != undefined &&
-            receiver.process_slate == false &&
+            receiver !== undefined &&
+            receiver.process_slate === false &&
             receiver.readyState === WebSocket.OPEN
         ) {
-            if (config.stats) {
-                statistics.slatesAttempt++;
-            }
+            if (config.stats) statistics.slatesAttempt++;
 
-            let slate = {
+            const slate = {
                 type: "Slate",
                 from: json.from,
                 str: json.str,
                 signature: json.signature,
-                challenge: "",
-
-                // id returned to sender
-                epicboxmsgid: messageid,
+                challenge: ""
             };
 
             if (
-                receiver.epicboxver == "2.0.0" ||
-                receiver.epicboxver == "3.0.0"
+                receiver.epicboxver === "2.0.0" ||
+                receiver.epicboxver === "3.0.0"
             ) {
+                slate.epicboxmsgid = messageid;
+                slate.epicboxtxid = epicboxtxid;
                 slate.ver = receiver.epicboxver;
             } else {
                 collection.updateOne(
-                    { messageid: messageid },
+                    { messageid },
                     { $set: { made: true } }
                 ).catch((err) => console.error("Error updateOne", err));
             }
-            // include the message id so the sender can canceltx later;
-            // older wallets ignore unknown fields on Ok
-            ws.send(JSON.stringify({
-                type: "Ok",
-                epicboxmsgid: messageid
-            }));
 
+            ws.send(JSON.stringify(response));
             receiver.send(JSON.stringify(slate));
             receiver.process_slate = true;
 
             console.log(
                 "Passthrough slate",
                 messageid,
+                "for transaction",
+                epicboxtxid,
                 "to",
                 receiver.epicPublicAddress
             );
 
-            config.debugMessage ? console.log(slate) : null;
+            if (config.debugMessage) console.log(slate);
         } else {
-            // receiver offline: slate stays queued in db. Return the
-            // message id so the sender can canceltx later; older wallets
-            // ignore unknown fields on Ok
-            ws.send(JSON.stringify({
-                type: "Ok",
-                epicboxmsgid: messageid
-            }));
+            ws.send(JSON.stringify(response));
         }
 
-        return; // Do not relay externally
+        return;
     }
 
-    // Only relay to foreign epicbox domains
+    // Foreign relay passthrough. New fields are additive; an old JavaScript
+    // relay ignores them and continues handling the original PostSlate fields.
+    const sock = new WebSocket(
+        `wss://${addressto.domain}:${addressto.port}`,
+        {
+            handshakeTimeout: 10000,
+            maxPayload: config.ws_max_payload
+        }
+    );
 
-    // declare sock and message locally w/ handshake timeout, explicit close after relay complete
-    const sock = new WebSocket("wss://" + addressto.domain + ":" + addressto.port, {
-        handshakeTimeout: 10000,
-        maxPayload: config.ws_max_payload
-    });
-
-    sock.on('error', (err) => {
+    sock.on("error", (err) => {
         console.error("Relay socket error", addressto.domain, err.message);
     });
 
-    sock.on('open', () => {
-        console.log("Connect " + addressto.domain + ":" + addressto.port);
+    sock.on("open", () => {
+        console.log(`Connect ${addressto.domain}:${addressto.port}`);
     });
 
-    sock.on('message', (data) => {
+    sock.on("message", async (data) => {
         try {
             const message = JSON.parse(data);
 
             if (message.type === "Challenge") {
-                let slate = {
+                const relaySlate = {
                     type: "PostSlate",
                     from: json.from,
                     to: json.to,
@@ -904,36 +1364,79 @@ const postSlate = async (ws, json) => {
                     signature: json.signature
                 };
 
-                sock.send(JSON.stringify(slate));
-            }
-
-            if (message.type === "Ok") {
-                if (config.stats) {
-                    statistics.slatesRelayedInHour++;
+                if (isEpicboxId(json.epicboxtxid)) {
+                    relaySlate.epicboxtxid = json.epicboxtxid;
+                    relaySlate.epicboxtxidsig = json.epicboxtxidsig;
                 }
 
-                console.log("Sent to wss://" + addressto.domain + ":" + addressto.port);
-
-                // preserve an epicboxmsgid from foreign relay
-                // foreign relay owns and generates this msgid
-                const response = {type: "Ok"};
-
-                if (
-                    typeof message.epicboxmsgid === "string" &&
-                    /^[A-Za-z0-9_-]{32}$/.test(message.epicboxmsgid)
-                ) {
-                    response.epicboxmsgid = message.epicboxmsgid;
-                }
-
-                ws.send(JSON.stringify(response));
-                sock.close(1000, "Relay complete.");
+                sock.send(JSON.stringify(relaySlate));
+                return;
             }
+
+            if (message.type !== "Ok") return;
+
+            if (config.stats) statistics.slatesRelayedInHour++;
+
+            const remoteMessageId = isEpicboxId(message.epicboxmsgid)
+                ? message.epicboxmsgid
+                : null;
+            const epicboxtxid = isEpicboxId(message.epicboxtxid)
+                ? message.epicboxtxid
+                : (
+                    isEpicboxId(json.epicboxtxid)
+                        ? json.epicboxtxid
+                        : remoteMessageId
+                );
+
+            if (epicboxtxid) {
+                // Never deliver route rows as Slates. They retain enough
+                // information to propagate a later transaction-wide cancel.
+                await collection.updateOne(
+                    {
+                        route: true,
+                        epicboxtxid,
+                        local_address: publicKeyFromAddress(json.from),
+                        remote_domain: addressto.domain,
+                        remote_port: Number(addressto.port)
+                    },
+                    {
+                        $setOnInsert: {
+                            route: true,
+                            made: true,
+                            queue: addressto.publicKey,
+                            replyto: json.from,
+                            to: json.to,
+                            local_address: publicKeyFromAddress(json.from),
+                            remote_address: addressto.publicKey,
+                            remote_domain: addressto.domain,
+                            remote_port: Number(addressto.port),
+                            createdat: new Date(),
+                            expiration: 86400000,
+                            messageid: remoteMessageId || uid(32),
+                            epicboxtxid
+                        }
+                    },
+                    { upsert: true }
+                );
+            }
+
+            const response = { type: "Ok" };
+            if (remoteMessageId) response.epicboxmsgid = remoteMessageId;
+            if (epicboxtxid) response.epicboxtxid = epicboxtxid;
+
+            console.log(
+                `Sent to wss://${addressto.domain}:${addressto.port}`,
+                epicboxtxid ? `for transaction ${epicboxtxid}` : ""
+            );
+
+            ws.send(JSON.stringify(response));
+            sock.close(1000, "Relay complete.");
         } catch (err) {
-            console.error("Error forward slate to foreign epicbox", err);
+            console.error("Error forwarding Slate to foreign Epicbox", err);
             ws.send(JSON.stringify({
                 type: "Error",
                 kind: "InvalidRequest",
-                description: `Error forward slate to foreign epicbox. ToDomain: ${addressto.domain}:${addressto.port}, err: ${err}`
+                description: `Error forwarding Slate to foreign Epicbox ${addressto.domain}:${addressto.port}.`
             }));
             sock.close(1002, "Relay error.");
         }

@@ -17,7 +17,34 @@ db.createUser({
   ]
 });
 
-db.slates.createIndex({ queue: 1, made: 1, createdat: 1 });
-db.slates.createIndex({ messageid: 1, made: 1 });
-// slates are deleted 7 days (604800sec) after creation
-db.slates.createIndex({ "createdat": 1 }, { expireAfterSeconds: 604800 });
+
+db.slates.createIndex({queue: 1, made: 1, createdat: 1});
+db.slates.createIndex({messageid: 1, made: 1});
+db.slates.createIndex({epicboxtxid: 1, made: 1});
+db.slates.createIndex({route: 1, epicboxtxid: 1});
+db.slates.createIndex(
+    {createdat: 1},
+    {expireAfterSeconds: 604800}
+);
+
+db.cancelled_slates.createIndex(
+    {epicboxtxid: 1},
+    {
+        unique: true,
+        // Existing tombstones may not have epicboxtxid yet.
+        partialFilterExpression: {
+            epicboxtxid: {$type: "string"}
+        }
+    }
+);
+
+db.cancelled_slates.createIndex({
+    participants: 1,
+    cancelledat: 1
+});
+
+db.cancelled_slates.createIndex(
+    {cancelledat: 1},
+    {expireAfterSeconds: 604800}
+);
+
