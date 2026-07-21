@@ -474,10 +474,12 @@ const subscribe = (ws, message) => {
                             str: payload.str,
                             signature: payload.signature,
                             challenge: payload.challenge,
+                            // Relay-generated identifier for this queued Slate.
+                            // The receiver stores this in its TxLogEntry.
+                            epicboxmsgid: dbslate.messageid,
                         };
 
                         if (ws.epicboxver == "2.0.0" || ws.epicboxver == "3.0.0") {
-                            slate.epicboxmsgid = dbslate.messageid;
                             slate.ver = ws.epicboxver;
                         } else {
                             collection.updateOne({ messageid: dbslate.messageid }, { $set: { made: true } })
@@ -759,7 +761,7 @@ const canceltx = (ws, message) => {
  @param {object} ws  - Client socket
  @param {json} message - Client message see epic wallet
 */
-const postSlate = (ws, json) => {
+const postSlate = async (ws, json) => {
 
     let str = {};
     try {
@@ -787,50 +789,89 @@ const postSlate = (ws, json) => {
         // challenge is not required, we keep it for backward compatibility
         let signed_payload = JSON.stringify({str: json.str, challenge: "", signature: json.signature});
         let messageid = uid(32);
-        collection.insertOne({
-            queue: addressto.publicKey,
-            made: false,
-            payload: Buffer.from(signed_payload),
-            replyto: json.from,
-            createdat: new Date(),
-            expiration: 86400000,
-            messageid: messageid
-        }).catch((err) => {
+
+        try {
+            // persist the before exposing its msgid. guarantees that a 
+            // subsequent cancel-tx can resolve it.
+            await collection.insertOne({
+                queue: addressto.publicKey,
+                made: false,
+                payload: Buffer.from(signed_payload),
+                replyto: json.from,
+                createdat: new Date(),
+                expiration: 86400000,
+                messageid: messageid
+            });
+        } catch (err) {
             console.error("Error insert to db", err);
-        });
+            return ws.send(JSON.stringify({
+                type: "Error",
+                kind: "StorageError",
+                description: "Unable to queue Slate."
+            }));
+        }
 
         let receiver = clients_publicaddress[addressto.publicKey];
-        if (receiver != undefined && receiver.process_slate == false && receiver.readyState === WebSocket.OPEN) {
+
+        if (
+            receiver != undefined &&
+            receiver.process_slate == false &&
+            receiver.readyState === WebSocket.OPEN
+        ) {
             if (config.stats) {
                 statistics.slatesAttempt++;
             }
+
             let slate = {
                 type: "Slate",
                 from: json.from,
                 str: json.str,
                 signature: json.signature,
                 challenge: "",
+
+                // id returned to sender
+                epicboxmsgid: messageid,
             };
-            if (receiver.epicboxver == "2.0.0" || receiver.epicboxver == "3.0.0") {
-                slate.epicboxmsgid = messageid;
+
+            if (
+                receiver.epicboxver == "2.0.0" ||
+                receiver.epicboxver == "3.0.0"
+            ) {
                 slate.ver = receiver.epicboxver;
             } else {
-                collection.updateOne({ messageid: messageid }, { $set: { made: true } })
-                    .catch((err) => console.error("Error updateOne", err));
+                collection.updateOne(
+                    { messageid: messageid },
+                    { $set: { made: true } }
+                ).catch((err) => console.error("Error updateOne", err));
             }
             // include the message id so the sender can canceltx later;
             // older wallets ignore unknown fields on Ok
-            ws.send(JSON.stringify({type:"Ok", epicboxmsgid: messageid}));
+            ws.send(JSON.stringify({
+                type: "Ok",
+                epicboxmsgid: messageid
+            }));
+
             receiver.send(JSON.stringify(slate));
             receiver.process_slate = true;
-            console.log("Passthrough slate to", receiver.epicPublicAddress);
+
+            console.log(
+                "Passthrough slate",
+                messageid,
+                "to",
+                receiver.epicPublicAddress
+            );
+
             config.debugMessage ? console.log(slate) : null;
         } else {
             // receiver offline: slate stays queued in db. Return the
             // message id so the sender can canceltx later; older wallets
             // ignore unknown fields on Ok
-            ws.send(JSON.stringify({type:"Ok", epicboxmsgid: messageid}));
+            ws.send(JSON.stringify({
+                type: "Ok",
+                epicboxmsgid: messageid
+            }));
         }
+
         return; // Do not relay externally
     }
 
@@ -841,30 +882,59 @@ const postSlate = (ws, json) => {
         handshakeTimeout: 10000,
         maxPayload: config.ws_max_payload
     });
+
     sock.on('error', (err) => {
         console.error("Relay socket error", addressto.domain, err.message);
     });
+
     sock.on('open', () => {
         console.log("Connect " + addressto.domain + ":" + addressto.port);
     });
+
     sock.on('message', (data) => {
         try {
             const message = JSON.parse(data);
+
             if (message.type === "Challenge") {
-                let slate = {type: "PostSlate", from: json.from, to: json.to, str: json.str, signature: json.signature};
+                let slate = {
+                    type: "PostSlate",
+                    from: json.from,
+                    to: json.to,
+                    str: json.str,
+                    signature: json.signature
+                };
+
                 sock.send(JSON.stringify(slate));
             }
+
             if (message.type === "Ok") {
                 if (config.stats) {
                     statistics.slatesRelayedInHour++;
                 }
+
                 console.log("Sent to wss://" + addressto.domain + ":" + addressto.port);
-                ws.send(JSON.stringify({type:"Ok"}));
+
+                // preserve an epicboxmsgid from foreign relay
+                // foreign relay owns and generates this msgid
+                const response = {type: "Ok"};
+
+                if (
+                    typeof message.epicboxmsgid === "string" &&
+                    /^[A-Za-z0-9_-]{32}$/.test(message.epicboxmsgid)
+                ) {
+                    response.epicboxmsgid = message.epicboxmsgid;
+                }
+
+                ws.send(JSON.stringify(response));
                 sock.close(1000, "Relay complete.");
             }
         } catch (err) {
             console.error("Error forward slate to foreign epicbox", err);
-            ws.send(JSON.stringify({type: "Error", kind: "InvalidRequest", description: `Error forward slate to foreign epicbox. ToDomain: ${addressto.domain}:${addressto.port}, err: ${err}`}));
+            ws.send(JSON.stringify({
+                type: "Error",
+                kind: "InvalidRequest",
+                description: `Error forward slate to foreign epicbox. ToDomain: ${addressto.domain}:${addressto.port}, err: ${err}`
+            }));
             sock.close(1002, "Relay error.");
         }
     });
@@ -933,14 +1003,18 @@ const startEpicbox = async () => {
     let configPath = customConfig != -1 && process.argv[customConfig + 1] != undefined ? process.argv[customConfig + 1] : './config.json';
     console.log("Use config:", configPath);
     await loadConfig(configPath);
+
     // fail fast if mongo is unreachable instead of driver default hang (30 sec)
     mongoclient = new MongoClient(config.mongourl, {
         serverSelectionTimeoutMS: 10000
     });
+
     let db = mongoclient.db(config.db_name);
     collection = db.collection(config.collection_name);
     cancelledCollection = db.collection(config.cancelled_collection_name);
+
     await mongoclient.connect();
+
     console.log('Connected successfully to MongoDB');
     server.listen(config.localepicboxserviceport);
     setInterval(challengeInterval, config.challenge_interval);
@@ -965,6 +1039,7 @@ const handle = async (signal) => {
     } catch (err) {
         console.error("Error closing MongoDB connection", err);
     }
+
     process.exit(0);
 }
 
@@ -979,6 +1054,7 @@ process.on('SIGTERM', handle);
 process.on('uncaughtException', (err) => {
     console.error('Uncaught exception:', err);
 });
+
 process.on('unhandledRejection', (reason) => {
     console.error('Unhandled rejection:', reason);
 });
