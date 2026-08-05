@@ -1054,6 +1054,14 @@ const canceltx = (ws, message) => {
         }));
     }
 
+    console.log(
+        "canceltx (pre-signature-check) request received from",
+        requester,
+        "for tx with epicboxtxid: ",
+        epicboxtxid
+    );
+
+
     if (typeof message.signature !== "string") {
         return ws.send(JSON.stringify({
             type: "Error",
@@ -1103,6 +1111,12 @@ const canceltx = (ws, message) => {
                     );
                     ws.send(JSON.stringify({ type: "Ok" }));
                     return;
+                } else {
+                    console.log(
+                        "canceltx: found matching pending transaction for",
+                        requester,
+                        epicboxtxid
+                    );
                 }
 
                 const participants = participantKeys(records);
