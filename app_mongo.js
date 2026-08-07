@@ -632,20 +632,11 @@ const sendNextPending = async (ws) => {
     const dbslate = records[0];
     const payload = JSON.parse(payloadToString(dbslate.payload));
 
-    if (!isEpicboxId(dbslate.epicboxtxid)) {
-        console.error(
-            "Refusing to deliver Slate with missing or invalid epicboxtxid",
-            dbslate.messageid
-        );
-        ws.send(JSON.stringify({
-            type: "Error",
-            kind: "InvalidRequest",
-            description: "Queued Slate has no valid epicboxtxid."
-        }));
-        return;
-    }
-
-    const epicboxtxid = dbslate.epicboxtxid;
+    // rows created by v3 server do not contain epicboxtxid.
+    // use legacy-compatible path for this case so we don't block
+    const epicboxtxid = isEpicboxId(dbslate.epicboxtxid)
+        ? dbslate.epicboxtxid
+        : null;
 
     const slate = {
         type: "Slate",
@@ -656,16 +647,18 @@ const sendNextPending = async (ws) => {
     };
 
     if (ws.epicboxver === "2.0.0" || ws.epicboxver === "3.0.0") {
-        slate.epicboxmsgid = dbslate.messageid;
-        slate.epicboxtxid = epicboxtxid;
+    slate.epicboxmsgid = dbslate.messageid;
         slate.ver = ws.epicboxver;
+
+        // Only new-protocol queue records have a stable transaction ID.
+        if (epicboxtxid !== null) {
+            slate.epicboxtxid = epicboxtxid;
+        }
     } else {
-        // Preserve legacy behavior for clients that did not advertise the
-        // versioned protocol and may reject unknown fields.
-        collection.updateOne(
-            { messageid: dbslate.messageid },
+        await collection.updateOne(
+            { _id: dbslate._id },
             { $set: { made: true } }
-        ).catch((err) => console.error("Error updateOne", err));
+        );
     }
 
     ws.send(JSON.stringify(slate));
@@ -675,7 +668,7 @@ const sendNextPending = async (ws) => {
         "Sent slate",
         dbslate.messageid,
         "for transaction",
-        epicboxtxid,
+        epicboxtxid || "<legacy-v3>",
         "to",
         ws.epicPublicAddress
     );
