@@ -837,6 +837,17 @@ const unsubscribe = (ws) => {
 */
 const validatePostslate = (ws, message) => {
     try {
+        const validation = {
+            from: typeof message.from,
+            to: typeof message.to,
+            str: typeof message.str,
+            signature: typeof message.signature,
+            epicboxtxid: message.epicboxtxid,
+            epicboxtxid_type: typeof message.epicboxtxid,
+            epicboxtxid_valid: isEpicboxId(message.epicboxtxid),
+            epicboxtxidsig_type: typeof message.epicboxtxidsig
+        };
+
         if (
             typeof message.from !== "string" ||
             typeof message.to !== "string" ||
@@ -845,10 +856,17 @@ const validatePostslate = (ws, message) => {
             !isEpicboxId(message.epicboxtxid) ||
             typeof message.epicboxtxidsig !== "string"
         ) {
+            console.error(
+                "Invalid PostSlate fields:",
+                validation
+            );
+
             return ws.send(JSON.stringify({
                 type: "Error",
                 kind: "InvalidRequest",
-                description: "PostSlate requires from, to, str, signature, epicboxtxid, and epicboxtxidsig."
+                description:
+                    "PostSlate requires from, to, str, signature, " +
+                    "epicboxtxid, and epicboxtxidsig."
             }));
         }
 
