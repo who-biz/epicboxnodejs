@@ -53,6 +53,33 @@ const clients_publicaddress = {};
 // Prevent a server-to-server CancelTx from looping while the original
 // cancellation is still being processed.
 const activeCancellations = new Set();
+
+// Transaction-level cancellation barrier. Unlike activeCancellations, which is
+// keyed by epicboxtxid:cancelrequestid and only prevents relay loops, this map
+// suppresses Slate delivery for A while an authenticated participant cancel is
+// being propagated. A refcount handles concurrent cancellation requests from
+// both participants.
+const cancellingTxids = new Map();
+
+const beginCancellation = (epicboxtxid) => {
+    cancellingTxids.set(
+        epicboxtxid,
+        (cancellingTxids.get(epicboxtxid) || 0) + 1
+    );
+};
+
+const endCancellation = (epicboxtxid) => {
+    const count = cancellingTxids.get(epicboxtxid) || 0;
+
+    if (count <= 1) {
+        cancellingTxids.delete(epicboxtxid);
+    } else {
+        cancellingTxids.set(epicboxtxid, count - 1);
+    }
+};
+
+const cancellationInProgress = (epicboxtxid) =>
+    cancellingTxids.has(epicboxtxid);
 const config = {
     mongourl: "mongodb://127.0.0.1:27019",
     epicbox_domain: process.env.EPICBOX_DOMAIN || "epicbox.your-domain.com",
@@ -458,6 +485,34 @@ const cancellationResponse = (epicboxtxid) => ({
     epicboxtxid
 });
 
+// Returns "pending" while a verified participant cancellation is being
+// propagated, "cancelled" once the durable tombstone exists, or null when
+// slate delivery is still allowed
+const getCancellationState = async (epicboxtxid) => {
+    if (!isEpicboxId(epicboxtxid)) return null;
+
+    if (cancellationInProgress(epicboxtxid)) {
+        return "pending";
+    }
+
+    const tombstone = await cancelledCollection.findOne(
+        { epicboxtxid },
+        { projection: { _id: 1, epicboxtxid: 1, participants: 1 } }
+    );
+
+    if (tombstone) {
+        return "cancelled";
+    }
+
+    // findOne() yields to the event loop. Re-check the in-memory barrier in
+    // case CancelTx became active while MongoDB was being queried
+    if (cancellationInProgress(epicboxtxid)) {
+        return "pending";
+    }
+
+    return null;
+};
+
 const sendCancellationToLocalParticipants = (
     epicboxtxid,
     participants,
@@ -602,7 +657,7 @@ const relayCancelToRemote = (
 });
 
 const sendNextPending = async (ws) => {
-    // Cancellation supersedes delivery of obsolete queued Slate states.
+    // cancellation supersedes delivery of obsolete queued slate states.
     if (await sendPendingCancellation(ws)) return;
 
     if (ws.process_slate !== false) {
@@ -615,7 +670,7 @@ const sendNextPending = async (ws) => {
         .find({
             queue: ws.epicPublicAddress,
             made: false,
-            // route:true rows are metadata, not deliverable Slates.
+            // route:true rows are metadata, not deliverable slates.
             route: { $ne: true }
         })
         .sort({ createdat: 1 })
@@ -630,13 +685,43 @@ const sendNextPending = async (ws) => {
     if (config.stats) statistics.slatesAttempt++;
 
     const dbslate = records[0];
-    const payload = JSON.parse(payloadToString(dbslate.payload));
 
-    // rows created by v3 server do not contain epicboxtxid.
-    // use legacy-compatible path for this case so we don't block
+    // rows created by older servers may not contain epicboxtxid. Preserve the
+    // legacy delivery path for those records, but a new-protocol record whose A
+    // is cancelling or cancelled must never be delivered.
     const epicboxtxid = isEpicboxId(dbslate.epicboxtxid)
         ? dbslate.epicboxtxid
         : null;
+
+    if (epicboxtxid !== null) {
+        const cancellationState = await getCancellationState(epicboxtxid);
+
+        if (cancellationState === "cancelled") {
+            // tombstones are authoritative. we remove any stale/resurrected rows
+            // for A before doing anything else
+            await collection.deleteMany({ epicboxtxid });
+
+            if (!ws.sent_cancelled_txids.has(epicboxtxid)) {
+                ws.process_slate = false;
+                ws.sendslate_attempts = 0;
+                ws.send(JSON.stringify(cancellationResponse(epicboxtxid)));
+                ws.sent_cancelled_txids.add(epicboxtxid);
+            } else {
+                ws.send(JSON.stringify({ type: "Ok" }));
+            }
+
+            return;
+        }
+
+        if (cancellationState === "pending") {
+            // cancellation may still fail on another relay, so do not delete
+            // the slate yet. suppress delivery for this subscription cycle
+            ws.send(JSON.stringify({ type: "Ok" }));
+            return;
+        }
+    }
+
+    const payload = JSON.parse(payloadToString(dbslate.payload));
 
     const slate = {
         type: "Slate",
@@ -650,7 +735,7 @@ const sendNextPending = async (ws) => {
     slate.epicboxmsgid = dbslate.messageid;
         slate.ver = ws.epicboxver;
 
-        // Only new-protocol queue records have a stable transaction ID.
+        // only new-protocol queue records have a stable transaction ID.
         if (epicboxtxid !== null) {
             slate.epicboxtxid = epicboxtxid;
         }
@@ -1149,6 +1234,7 @@ const canceltx = (ws, message) => {
                 }
 
                 activeCancellations.add(activeKey);
+                beginCancellation(epicboxtxid);
 
                 try {
                     const remoteEndpoints = remoteRelayEndpoints(records);
@@ -1202,6 +1288,7 @@ const canceltx = (ws, message) => {
                         ws
                     );
                 } finally {
+                    endCancellation(epicboxtxid);
                     activeCancellations.delete(activeKey);
                 }
             } catch (err) {
@@ -1261,6 +1348,30 @@ const postSlate = async (ws, json) => {
         String(addressto.port) === String(config.epicbox_port)
     );
 
+    // A durable tombstone is terminal, and a verified cancellation currently
+    // being propagated temporarily suppresses all later Slate states for A.
+    const cancellationState = await getCancellationState(json.epicboxtxid);
+
+    if (cancellationState === "cancelled") {
+        console.log(
+            "Rejecting PostSlate for cancelled transaction",
+            json.epicboxtxid
+        );
+        return ws.send(JSON.stringify(cancellationResponse(json.epicboxtxid)));
+    }
+
+    if (cancellationState === "pending") {
+        console.log(
+            "Rejecting PostSlate while cancellation is in progress",
+            json.epicboxtxid
+        );
+        return ws.send(JSON.stringify({
+            type: "Error",
+            kind: "InvalidRequest",
+            description: "Transaction cancellation is in progress; PostSlate rejected."
+        }));
+    }
+
     if (isLocalDestination) {
         const signedPayload = JSON.stringify({
             str: json.str,
@@ -1268,14 +1379,16 @@ const postSlate = async (ws, json) => {
             signature: json.signature
         });
 
-        // M_n is unique to this queued Slate; A was generated by the
-        // initiating wallet and is stable for the transaction.
+        // messageid is unique to this queued Slate; epicboxtxid was generated by the
+        // initiating wallet and is stable for the transaction
         const messageid = uid(32);
         const epicboxtxid = json.epicboxtxid;
         const sourceEndpoint = endpointFromAddress(json.from);
 
+        let insertResult;
+
         try {
-            await collection.insertOne({
+            insertResult = await collection.insertOne({
                 queue: addressto.publicKey,
                 made: false,
                 route: false,
@@ -1296,6 +1409,25 @@ const postSlate = async (ws, json) => {
                 type: "Error",
                 kind: "InvalidRequest",
                 description: "Unable to queue Slate."
+            }));
+        }
+
+        // insertOne() yields to the event loop. if cancellation started or
+        // completed while the row was being written, remove exactly the row we
+        // just created and do not expose it to the receiver
+        const postInsertCancellationState = await getCancellationState(epicboxtxid);
+
+        if (postInsertCancellationState !== null) {
+            await collection.deleteOne({ _id: insertResult.insertedId });
+
+            if (postInsertCancellationState === "cancelled") {
+                return ws.send(JSON.stringify(cancellationResponse(epicboxtxid)));
+            }
+
+            return ws.send(JSON.stringify({
+                type: "Error",
+                kind: "InvalidRequest",
+                description: "Transaction cancellation is in progress; PostSlate rejected."
             }));
         }
 
@@ -1379,6 +1511,34 @@ const postSlate = async (ws, json) => {
             const message = JSON.parse(data);
 
             if (message.type === "Challenge") {
+                // re-check immediately before the cross-relay send. the
+                // outbound ws handshake yields to the event loop so a
+                // cancellation may have started since postSlate() began
+                const relayCancellationState =
+                    await getCancellationState(json.epicboxtxid);
+
+                if (relayCancellationState !== null) {
+                    if (ws.readyState === WebSocket.OPEN) {
+                        if (relayCancellationState === "cancelled") {
+                            ws.send(JSON.stringify(
+                                cancellationResponse(json.epicboxtxid)
+                            ));
+                        } else {
+                            ws.send(JSON.stringify({
+                                type: "Error",
+                                kind: "InvalidRequest",
+                                description: "Transaction cancellation is in progress; PostSlate rejected."
+                            }));
+                        }
+                    }
+
+                    sock.close(
+                        1000,
+                        "PostSlate suppressed by transaction cancellation."
+                    );
+                    return;
+                }
+
                 const relaySlate = {
                     type: "PostSlate",
                     from: json.from,
@@ -1441,8 +1601,8 @@ const postSlate = async (ws, json) => {
                 : null;
             const epicboxtxid = json.epicboxtxid;
 
-            // Never deliver route rows as Slates. They retain enough
-            // information to propagate a later transaction-wide cancel.
+            // never deliver route rows as slates. they retain enough
+            // information to propagate a later transaction-wide cancel
             await collection.updateOne(
                 {
                     route: true,
