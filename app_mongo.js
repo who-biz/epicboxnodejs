@@ -17,6 +17,7 @@
   }
  );
  db.cancelled_slates.createIndex({ participants: 1, cancelledat: 1 });
+ db.cancelled_slates.createIndex({ receiver: 1, receiver_acknowledged: 1, cancelledat: 1 });
  db.cancelled_slates.createIndex({ "cancelledat": 1 }, { expireAfterSeconds: 604800 });
  db.createUser(
   {
@@ -241,8 +242,9 @@ wss.on('connection', (ws, req) => {
     ws.sendslate_attempts = 0;
     ws.max_sendslate_attempts = 0;
     ws.pending_challenge = false;
-    // Tombstones are re-delivered after reconnect, but only once per socket.
-    ws.sent_cancelled_txids = new Set();
+    // If a TransactionCancelled notification is sent on this socket, the
+    // receiver's next authenticated Subscribe acknowledges it.
+    ws.pending_cancel_ack = null;
     ws.client_details = {
         wallet_version: '',
         wallet_mode: '',
@@ -513,41 +515,83 @@ const getCancellationState = async (epicboxtxid) => {
     return null;
 };
 
-const sendCancellationToLocalParticipants = (
+const sendCancellationToLocalReceiver = (
     epicboxtxid,
-    participants,
+    receiver,
     requesterSocket
 ) => {
     const response = JSON.stringify(cancellationResponse(epicboxtxid));
 
+    // Confirm the CancelTx request to its requester. This is protocol
+    // confirmation only; it is not the receiver acknowledgement.
     if (requesterSocket && requesterSocket.readyState === WebSocket.OPEN) {
         requesterSocket.process_slate = false;
         requesterSocket.sendslate_attempts = 0;
         requesterSocket.send(response);
-        requesterSocket.sent_cancelled_txids?.add(epicboxtxid);
     }
 
-    for (const participant of participants) {
-        const client = clients_publicaddress[participant];
+    if (typeof receiver !== "string") {
+        return;
+    }
 
-        if (
-            client &&
-            client !== requesterSocket &&
-            client.readyState === WebSocket.OPEN
-        ) {
-            client.process_slate = false;
-            client.sendslate_attempts = 0;
-            client.send(response);
-            client.sent_cancelled_txids?.add(epicboxtxid);
+    const client = clients_publicaddress[receiver];
+
+    if (
+        client &&
+        client !== requesterSocket &&
+        client.readyState === WebSocket.OPEN
+    ) {
+        client.process_slate = false;
+        client.sendslate_attempts = 0;
+        client.send(response);
+
+        // Do not mark the tombstone acknowledged merely because it was sent.
+        // The wallet acknowledges it by successfully sending another Subscribe.
+        client.pending_cancel_ack = epicboxtxid;
+    }
+};
+
+const acknowledgePendingCancellation = async (ws) => {
+    const epicboxtxid = ws.pending_cancel_ack;
+
+    if (
+        !isEpicboxId(epicboxtxid) ||
+        typeof ws.epicPublicAddress !== "string"
+    ) {
+        ws.pending_cancel_ack = null;
+        return;
+    }
+
+    const result = await cancelledCollection.updateOne(
+        {
+            epicboxtxid,
+            receiver: ws.epicPublicAddress,
+            receiver_acknowledged: { $ne: true }
+        },
+        {
+            $set: {
+                receiver_acknowledged: true,
+                receiver_acknowledged_at: new Date()
+            }
         }
+    );
+
+    if (result.modifiedCount > 0) {
+        console.log(
+            "Receiver acknowledged cancellation",
+            epicboxtxid,
+            ws.epicPublicAddress
+        );
     }
+
+    ws.pending_cancel_ack = null;
 };
 
 const sendPendingCancellation = async (ws) => {
     const tombstone = await cancelledCollection.findOne(
         {
-            participants: ws.epicPublicAddress,
-            epicboxtxid: { $nin: [...ws.sent_cancelled_txids] }
+            receiver: ws.epicPublicAddress,
+            receiver_acknowledged: { $ne: true }
         },
         { sort: { cancelledat: 1 } }
     );
@@ -559,7 +603,10 @@ const sendPendingCancellation = async (ws) => {
     ws.process_slate = false;
     ws.sendslate_attempts = 0;
     ws.send(JSON.stringify(cancellationResponse(tombstone.epicboxtxid)));
-    ws.sent_cancelled_txids.add(tombstone.epicboxtxid);
+
+    // Keep the durable tombstone until this exact receiver proves it handled
+    // the cancellation by successfully subscribing again.
+    ws.pending_cancel_ack = tombstone.epicboxtxid;
 
     return true;
 };
@@ -697,18 +744,15 @@ const sendNextPending = async (ws) => {
         const cancellationState = await getCancellationState(epicboxtxid);
 
         if (cancellationState === "cancelled") {
-            // tombstones are authoritative. we remove any stale/resurrected rows
-            // for A before doing anything else
+            // Tombstones remain authoritative even after the receiver has
+            // acknowledged cancellation, so stale Slate states cannot resurrect A.
             await collection.deleteMany({ epicboxtxid });
 
-            if (!ws.sent_cancelled_txids.has(epicboxtxid)) {
-                ws.process_slate = false;
-                ws.sendslate_attempts = 0;
-                ws.send(JSON.stringify(cancellationResponse(epicboxtxid)));
-                ws.sent_cancelled_txids.add(epicboxtxid);
-            } else {
-                ws.send(JSON.stringify({ type: "Ok" }));
-            }
+            // Any outstanding receiver notification is handled by
+            // sendPendingCancellation() at the top of this function.
+            ws.process_slate = false;
+            ws.sendslate_attempts = 0;
+            ws.send(JSON.stringify({ type: "Ok" }));
 
             return;
         }
@@ -833,7 +877,7 @@ const subscribe = (ws, message) => {
 
     epicboxlib(
         ["verifysignature", message.address, ws.challenge, message.signature],
-        (verified) => {
+        async (verified) => {
             if (!verified) {
                 removeListenerMapping(ws);
                 ws.send(JSON.stringify({
@@ -847,6 +891,25 @@ const subscribe = (ws, message) => {
             if (config.stats) statistics.subscribeInHour++;
 
             ws.epicPublicAddress = message.address;
+
+            // A TransactionCancelled notification is considered handled only
+            // after the receiver successfully authenticates another Subscribe.
+            // This survives socket reconnects without replaying acknowledged
+            // tombstones forever.
+            try {
+                await acknowledgePendingCancellation(ws);
+            } catch (err) {
+                console.error(
+                    "Error acknowledging pending cancellation",
+                    err
+                );
+                ws.send(JSON.stringify({
+                    type: "Error",
+                    kind: "InvalidRequest",
+                    description: "Unable to acknowledge cancellation."
+                }));
+                return;
+            }
 
             if (
                 clients_publicaddress[ws.epicPublicAddress] === undefined &&
@@ -1221,6 +1284,23 @@ const canceltx = (ws, message) => {
                     return;
                 }
 
+                // Epicbox transactions are two-party. Notify only the other
+                // participant, not every participant socket on every reconnect.
+                const receiverCandidates = participants.filter(
+                    (participant) => participant !== requester
+                );
+                const receiver = receiverCandidates.length === 1
+                    ? receiverCandidates[0]
+                    : null;
+
+                if (receiverCandidates.length !== 1) {
+                    console.warn(
+                        "Unable to determine a single cancellation receiver for",
+                        epicboxtxid,
+                        receiverCandidates
+                    );
+                }
+
                 const cancelrequestid = isEpicboxId(message.cancelrequestid)
                     ? message.cancelrequestid
                     : uid(32);
@@ -1258,13 +1338,18 @@ const canceltx = (ws, message) => {
                     }
 
                     // Record the transaction-wide tombstone before deleting
-                    // any individual Slate states.
+                    // any individual Slate states. The tombstone remains as a
+                    // cancellation barrier until TTL expiry, while
+                    // receiver_acknowledged controls whether it still needs to
+                    // be delivered to the peer.
                     await cancelledCollection.updateOne(
                         { epicboxtxid },
                         {
                             $setOnInsert: {
                                 epicboxtxid,
                                 participants,
+                                receiver,
+                                receiver_acknowledged: receiver === null,
                                 cancelledat: new Date()
                             }
                         },
@@ -1282,9 +1367,9 @@ const canceltx = (ws, message) => {
                         epicboxtxid
                     );
 
-                    sendCancellationToLocalParticipants(
+                    sendCancellationToLocalReceiver(
                         epicboxtxid,
-                        participants,
+                        receiver,
                         ws
                     );
                 } finally {
