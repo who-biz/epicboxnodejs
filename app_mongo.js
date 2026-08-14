@@ -43,7 +43,7 @@ const { MongoClient } = require('mongodb');
 
 const customConfig = process.argv.indexOf('--config');
 // this epicbox protocol version
-const protver = "3.0.0";
+const protver = "3.1.0";
 /**
  * @deprecated in wallet version 3.5.2
  * use dynamic challenge strings
@@ -394,6 +394,11 @@ const isEpicboxId = (value) => (
     typeof value === "string" && EPICBOX_ID_RE.test(value)
 );
 
+// Stable transaction IDs and transaction cancellation are protocol 3.1.0
+// features. Older clients keep the legacy Slate/Ok/Error response vocabulary.
+const supportsTxCancellation = (ws) =>
+    ws != null && ws.epicboxver === "3.1.0";
+
 const publicKeyFromAddress = (address) => {
     if (typeof address !== "string") return null;
     return address.split("@")[0] || null;
@@ -539,7 +544,8 @@ const sendCancellationToLocalReceiver = (
     if (
         client &&
         client !== requesterSocket &&
-        client.readyState === WebSocket.OPEN
+        client.readyState === WebSocket.OPEN &&
+        supportsTxCancellation(client)
     ) {
         client.process_slate = false;
         client.sendslate_attempts = 0;
@@ -552,6 +558,11 @@ const sendCancellationToLocalReceiver = (
 };
 
 const acknowledgePendingCancellation = async (ws) => {
+    if (!supportsTxCancellation(ws)) {
+        ws.pending_cancel_ack = null;
+        return;
+    }
+
     const epicboxtxid = ws.pending_cancel_ack;
 
     if (
@@ -588,6 +599,10 @@ const acknowledgePendingCancellation = async (ws) => {
 };
 
 const sendPendingCancellation = async (ws) => {
+    if (!supportsTxCancellation(ws)) {
+        return false;
+    }
+
     const tombstone = await cancelledCollection.findOne(
         {
             receiver: ws.epicPublicAddress,
@@ -775,12 +790,16 @@ const sendNextPending = async (ws) => {
         challenge: payload.challenge
     };
 
-    if (ws.epicboxver === "2.0.0" || ws.epicboxver === "3.0.0") {
-    slate.epicboxmsgid = dbslate.messageid;
+    if (
+        ws.epicboxver === "2.0.0" ||
+        ws.epicboxver === "3.0.0" ||
+        ws.epicboxver === "3.1.0"
+    ) {
+        slate.epicboxmsgid = dbslate.messageid;
         slate.ver = ws.epicboxver;
 
-        // only new-protocol queue records have a stable transaction ID.
-        if (epicboxtxid !== null) {
+        // epicboxtxid is a 3.1.0 wire field. Keep older Slate shapes unchanged.
+        if (supportsTxCancellation(ws) && epicboxtxid !== null) {
             slate.epicboxtxid = epicboxtxid;
         }
     } else {
@@ -869,7 +888,11 @@ const subscribe = (ws, message) => {
             case "2.0.0":
                 ws.epicboxver = "2.0.0";
             break;
+            case "3.1.0":
+                ws.epicboxver = "3.1.0";
+            break;
             default:
+                // Preserve legacy behavior for 3.0.0 and unknown versions.
                 ws.epicboxver = "3.0.0";
             break;
         }
@@ -985,24 +1008,44 @@ const unsubscribe = (ws) => {
 */
 const validatePostslate = (ws, message) => {
     try {
+        const hasEpicboxTxId = Object.prototype.hasOwnProperty.call(
+            message,
+            "epicboxtxid"
+        );
+        const hasEpicboxTxIdSig = Object.prototype.hasOwnProperty.call(
+            message,
+            "epicboxtxidsig"
+        );
+        const hasStableTxId = hasEpicboxTxId && hasEpicboxTxIdSig;
+
         const validation = {
             from: typeof message.from,
             to: typeof message.to,
             str: typeof message.str,
             signature: typeof message.signature,
+            has_epicboxtxid: hasEpicboxTxId,
+            has_epicboxtxidsig: hasEpicboxTxIdSig,
             epicboxtxid: message.epicboxtxid,
             epicboxtxid_type: typeof message.epicboxtxid,
             epicboxtxid_valid: isEpicboxId(message.epicboxtxid),
             epicboxtxidsig_type: typeof message.epicboxtxidsig
         };
 
+        // Legacy PostSlate has neither stable-ID field. Protocol 3.1.0 has both.
+        // A partially-specified or malformed 3.1.0 request is always rejected.
         if (
             typeof message.from !== "string" ||
             typeof message.to !== "string" ||
             typeof message.str !== "string" ||
             typeof message.signature !== "string" ||
-            !isEpicboxId(message.epicboxtxid) ||
-            typeof message.epicboxtxidsig !== "string"
+            hasEpicboxTxId !== hasEpicboxTxIdSig ||
+            (
+                hasStableTxId &&
+                (
+                    !isEpicboxId(message.epicboxtxid) ||
+                    typeof message.epicboxtxidsig !== "string"
+                )
+            )
         ) {
             console.error(
                 "Invalid PostSlate fields:",
@@ -1013,8 +1056,9 @@ const validatePostslate = (ws, message) => {
                 type: "Error",
                 kind: "InvalidRequest",
                 description:
-                    "PostSlate requires from, to, str, signature, " +
-                    "epicboxtxid, and epicboxtxidsig."
+                    "PostSlate requires from, to, str, and signature. " +
+                    "epicboxtxid and epicboxtxidsig must either both be absent " +
+                    "(legacy) or both be valid (protocol 3.1.0)."
             }));
         }
 
@@ -1065,6 +1109,13 @@ const validatePostslate = (ws, message) => {
                                 }
                             });
                         };
+
+                        // The legacy request ends here; its original Slate
+                        // signature validation remains unchanged.
+                        if (!hasStableTxId) {
+                            acceptPostSlate();
+                            return;
+                        }
 
                         epicboxlib(
                             [
@@ -1135,9 +1186,18 @@ const validatePostslate = (ws, message) => {
 */
 const made = (ws, message) => {
 
-    if (ws.epicPublicAddress != null && message.hasOwnProperty("epicboxmsgid") && message.hasOwnProperty("ver") && (message.ver == "2.0.0" || message.ver == "3.0.0")) {
+    if (
+        ws.epicPublicAddress != null &&
+        message.hasOwnProperty("epicboxmsgid") &&
+        message.hasOwnProperty("ver") &&
+        (
+            message.ver == "2.0.0" ||
+            message.ver == "3.0.0" ||
+            message.ver == "3.1.0"
+        )
+    ) {
         let args = [];
-        if (message.ver == "3.0.0") {
+        if (message.ver == "3.0.0" || message.ver == "3.1.0") {
             args = ["verifysignature", ws.epicPublicAddress, message.epicboxmsgid, message.signature];
         } else {
             args = ["verifysignature", ws.epicPublicAddress, ws.challenge, message.signature];
@@ -1432,10 +1492,16 @@ const postSlate = async (ws, json) => {
         addressto.domain === config.epicbox_domain &&
         String(addressto.port) === String(config.epicbox_port)
     );
+    const hasStableTxId = (
+        isEpicboxId(json.epicboxtxid) &&
+        typeof json.epicboxtxidsig === "string"
+    );
 
     // A durable tombstone is terminal, and a verified cancellation currently
     // being propagated temporarily suppresses all later Slate states for A.
-    const cancellationState = await getCancellationState(json.epicboxtxid);
+    const cancellationState = hasStableTxId
+        ? await getCancellationState(json.epicboxtxid)
+        : null;
 
     if (cancellationState === "cancelled") {
         console.log(
@@ -1464,30 +1530,36 @@ const postSlate = async (ws, json) => {
             signature: json.signature
         });
 
-        // messageid is unique to this queued Slate; epicboxtxid was generated by the
-        // initiating wallet and is stable for the transaction
+        // messageid is unique to this queued Slate. Protocol 3.1.0 also carries
+        // a sender-generated epicboxtxid that is stable for the transaction.
         const messageid = uid(32);
-        const epicboxtxid = json.epicboxtxid;
+        const epicboxtxid = hasStableTxId ? json.epicboxtxid : null;
         const sourceEndpoint = endpointFromAddress(json.from);
+
+        const record = {
+            queue: addressto.publicKey,
+            made: false,
+            route: false,
+            payload: Buffer.from(signedPayload),
+            replyto: json.from,
+            to: json.to,
+            createdat: new Date(),
+            expiration: 86400000,
+            messageid,
+            remote_domain: sourceEndpoint?.domain,
+            remote_port: sourceEndpoint?.port
+        };
+
+        // Keep legacy records free of 3.1.0-only stable-ID fields.
+        if (hasStableTxId) {
+            record.epicboxtxid = epicboxtxid;
+            record.epicboxtxidsig = json.epicboxtxidsig;
+        }
 
         let insertResult;
 
         try {
-            insertResult = await collection.insertOne({
-                queue: addressto.publicKey,
-                made: false,
-                route: false,
-                payload: Buffer.from(signedPayload),
-                replyto: json.from,
-                to: json.to,
-                createdat: new Date(),
-                expiration: 86400000,
-                messageid,
-                epicboxtxid,
-                epicboxtxidsig: json.epicboxtxidsig,
-                remote_domain: sourceEndpoint?.domain,
-                remote_port: sourceEndpoint?.port
-            });
+            insertResult = await collection.insertOne(record);
         } catch (err) {
             console.error("Error insert to db", err);
             return ws.send(JSON.stringify({
@@ -1500,7 +1572,9 @@ const postSlate = async (ws, json) => {
         // insertOne() yields to the event loop. if cancellation started or
         // completed while the row was being written, remove exactly the row we
         // just created and do not expose it to the receiver
-        const postInsertCancellationState = await getCancellationState(epicboxtxid);
+        const postInsertCancellationState = hasStableTxId
+            ? await getCancellationState(epicboxtxid)
+            : null;
 
         if (postInsertCancellationState !== null) {
             await collection.deleteOne({ _id: insertResult.insertedId });
@@ -1516,11 +1590,13 @@ const postSlate = async (ws, json) => {
             }));
         }
 
-        const response = {
-            type: "Ok",
-            epicboxmsgid: messageid,
-            epicboxtxid
-        };
+        const response = hasStableTxId
+            ? {
+                type: "Ok",
+                epicboxmsgid: messageid,
+                epicboxtxid
+            }
+            : { type: "Ok" };
         const receiver = clients_publicaddress[addressto.publicKey];
 
         if (
@@ -1540,11 +1616,15 @@ const postSlate = async (ws, json) => {
 
             if (
                 receiver.epicboxver === "2.0.0" ||
-                receiver.epicboxver === "3.0.0"
+                receiver.epicboxver === "3.0.0" ||
+                receiver.epicboxver === "3.1.0"
             ) {
                 slate.epicboxmsgid = messageid;
-                slate.epicboxtxid = epicboxtxid;
                 slate.ver = receiver.epicboxver;
+
+                if (supportsTxCancellation(receiver) && hasStableTxId) {
+                    slate.epicboxtxid = epicboxtxid;
+                }
             } else {
                 collection.updateOne(
                     { messageid },
@@ -1599,8 +1679,9 @@ const postSlate = async (ws, json) => {
                 // re-check immediately before the cross-relay send. the
                 // outbound ws handshake yields to the event loop so a
                 // cancellation may have started since postSlate() began
-                const relayCancellationState =
-                    await getCancellationState(json.epicboxtxid);
+                const relayCancellationState = hasStableTxId
+                    ? await getCancellationState(json.epicboxtxid)
+                    : null;
 
                 if (relayCancellationState !== null) {
                     if (ws.readyState === WebSocket.OPEN) {
@@ -1629,10 +1710,13 @@ const postSlate = async (ws, json) => {
                     from: json.from,
                     to: json.to,
                     str: json.str,
-                    signature: json.signature,
-                    epicboxtxid: json.epicboxtxid,
-                    epicboxtxidsig: json.epicboxtxidsig
+                    signature: json.signature
                 };
+
+                if (hasStableTxId) {
+                    relaySlate.epicboxtxid = json.epicboxtxid;
+                    relaySlate.epicboxtxidsig = json.epicboxtxidsig;
+                }
 
                 sock.send(JSON.stringify(relaySlate));
                 return;
@@ -1655,14 +1739,25 @@ const postSlate = async (ws, json) => {
 
             if (message.type !== "Ok") return;
 
+            const remoteAckHasTxId = Object.prototype.hasOwnProperty.call(
+                message,
+                "epicboxtxid"
+            );
+
+            // A bare Ok is the legacy relay acknowledgement. If a relay includes
+            // epicboxtxid, it must be valid and must match the ID we sent.
             if (
-                !isEpicboxId(message.epicboxtxid) ||
-                message.epicboxtxid !== json.epicboxtxid
+                remoteAckHasTxId &&
+                (
+                    !hasStableTxId ||
+                    !isEpicboxId(message.epicboxtxid) ||
+                    message.epicboxtxid !== json.epicboxtxid
+                )
             ) {
                 console.error(
                     "Foreign relay returned an invalid or mismatched epicboxtxid",
                     {
-                        expected: json.epicboxtxid,
+                        expected: hasStableTxId ? json.epicboxtxid : "<legacy>",
                         returned: message.epicboxtxid,
                         relay: `${addressto.domain}:${addressto.port}`
                     }
@@ -1672,7 +1767,7 @@ const postSlate = async (ws, json) => {
                     ws.send(JSON.stringify({
                         type: "Error",
                         kind: "InvalidRequest",
-                        description: "Foreign relay did not acknowledge the expected epicboxtxid."
+                        description: "Foreign relay returned an invalid PostSlate acknowledgement."
                     }));
                 }
                 sock.close(1002, "Invalid PostSlate acknowledgement.");
@@ -1684,50 +1779,57 @@ const postSlate = async (ws, json) => {
             const remoteMessageId = isEpicboxId(message.epicboxmsgid)
                 ? message.epicboxmsgid
                 : null;
-            const epicboxtxid = json.epicboxtxid;
+            const epicboxtxid = hasStableTxId ? json.epicboxtxid : null;
 
-            // never deliver route rows as slates. they retain enough
-            // information to propagate a later transaction-wide cancel
-            await collection.updateOne(
-                {
-                    route: true,
-                    epicboxtxid,
-                    local_address: publicKeyFromAddress(json.from),
-                    remote_domain: addressto.domain,
-                    remote_port: Number(addressto.port)
-                },
-                {
-                    $setOnInsert: {
+            if (hasStableTxId) {
+                // Never deliver route rows as slates. They retain enough
+                // information to propagate a later transaction-wide cancel. A
+                // legacy remote relay may return bare Ok; keep A locally anyway.
+                await collection.updateOne(
+                    {
                         route: true,
-                        made: true,
-                        queue: addressto.publicKey,
-                        replyto: json.from,
-                        to: json.to,
+                        epicboxtxid,
                         local_address: publicKeyFromAddress(json.from),
-                        remote_address: addressto.publicKey,
                         remote_domain: addressto.domain,
-                        remote_port: Number(addressto.port),
-                        createdat: new Date(),
-                        expiration: 86400000,
-                        messageid: remoteMessageId || uid(32),
-                        epicboxtxid
-                    }
-                },
-                { upsert: true }
-            );
+                        remote_port: Number(addressto.port)
+                    },
+                    {
+                        $setOnInsert: {
+                            route: true,
+                            made: true,
+                            queue: addressto.publicKey,
+                            replyto: json.from,
+                            to: json.to,
+                            local_address: publicKeyFromAddress(json.from),
+                            remote_address: addressto.publicKey,
+                            remote_domain: addressto.domain,
+                            remote_port: Number(addressto.port),
+                            createdat: new Date(),
+                            expiration: 86400000,
+                            messageid: remoteMessageId || uid(32),
+                            epicboxtxid
+                        }
+                    },
+                    { upsert: true }
+                );
+            }
 
-            const response = {
-                type: "Ok",
-                epicboxtxid
-            };
+            const response = hasStableTxId
+                ? {
+                    type: "Ok",
+                    epicboxtxid
+                }
+                : { type: "Ok" };
 
-            if (remoteMessageId) {
+            if (hasStableTxId && remoteMessageId) {
                 response.epicboxmsgid = remoteMessageId;
             }
 
             console.log(
                 `Sent to wss://${addressto.domain}:${addressto.port}`,
-                `for transaction ${epicboxtxid}`
+                hasStableTxId
+                    ? `for transaction ${epicboxtxid}`
+                    : "using legacy PostSlate"
             );
 
             if (ws.readyState === WebSocket.OPEN) {
