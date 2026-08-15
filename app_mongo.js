@@ -1207,7 +1207,25 @@ const made = (ws, message) => {
 
             if (verified) {
                 console.log("Update for ", message.epicboxmsgid);
-                collection.updateOne({queue: ws.epicPublicAddress, messageid: message.epicboxmsgid, made: false}, { $set: {made: true}}).then((updateResult) => {
+                collection.findOne({
+                    queue: ws.epicPublicAddress,
+                    messageid: message.epicboxmsgid
+                }).then((dbslate) => {
+                    const filter = dbslate && isEpicboxId(dbslate.epicboxtxid)
+                        ? {
+                            queue: ws.epicPublicAddress,
+                            epicboxtxid: dbslate.epicboxtxid,
+                            made: false,
+                            route: { $ne: true }
+                        }
+                        : {
+                            queue: ws.epicPublicAddress,
+                            messageid: message.epicboxmsgid,
+                            made: false
+                        };
+
+                    return collection.updateMany(filter, { $set: {made: true}});
+                }).then((updateResult) => {
                     config.debugMessage ? console.log("DB update result", updateResult) : null;
                     ws.send(JSON.stringify({type:"Ok"}));
                     ws.process_slate = false;
